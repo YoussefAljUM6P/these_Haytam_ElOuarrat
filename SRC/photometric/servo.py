@@ -84,9 +84,13 @@ class PhotometricServo:
 
     def solve(self, e, L):
         if e.numel() < 6 or L.shape[1] != 6:
+            ssd = float(e.pow(2).sum().item()) if e.numel() else 0.0
+            mse = ssd / max(int(e.numel()), 1)
             return torch.zeros(6, dtype=torch.float32, device=e.device), {
                 "residual_norm": float(e.norm().item()) if e.numel() else 0.0,
-                "cost": float(0.5 * e.pow(2).sum().item()) if e.numel() else 0.0,
+                "residual_ssd": ssd,
+                "residual_mse_per_px": mse,
+                "cost": 0.5 * ssd,
                 "mu": self.mu,
                 "num_pixels": int(e.numel()),
                 "huber_k": None,
@@ -130,6 +134,8 @@ class PhotometricServo:
 
         info = {
             "residual_norm": float(e.norm().item()),
+            "residual_ssd": float(e.pow(2).sum().item()),
+            "residual_mse_per_px": float(e.pow(2).mean().item()),
             "cost": cost,
             "mu": self.mu,
             "num_pixels": int(e.numel()),

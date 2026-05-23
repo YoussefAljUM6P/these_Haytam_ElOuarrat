@@ -8,6 +8,7 @@ Examples:
 import argparse
 import csv
 import re
+import sys
 from pathlib import Path
 
 import cv2
@@ -17,6 +18,12 @@ from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_ROOT = PROJECT_ROOT / "RUNS"
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from runners.trajectory import read_tum
 
 
 def natural_key(path):
@@ -131,23 +138,7 @@ def collect_frames(run_dir, scene=None, pattern="visualizations/*.png"):
 
 
 def read_tum_poses(path):
-    from scipy.spatial.transform import Rotation
-
-    poses = []
-    with open(path) as f:
-        for line in f:
-            parts = line.strip().split()
-            if not parts or parts[0].startswith("#"):
-                continue
-            if len(parts) != 8:
-                raise ValueError(f"Bad TUM row in {path}: {line!r}")
-            _, tx, ty, tz, qx, qy, qz, qw = (float(part) for part in parts)
-            T_world_cam = np.eye(4, dtype=np.float32)
-            T_world_cam[:3, :3] = Rotation.from_quat(
-                [qx, qy, qz, qw]
-            ).as_matrix().astype(np.float32)
-            T_world_cam[:3, 3] = [tx, ty, tz]
-            poses.append(T_world_cam)
+    _, poses = read_tum(path)
     return poses
 
 

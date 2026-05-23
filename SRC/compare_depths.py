@@ -5,6 +5,7 @@ import random
 from pathlib import Path
 
 import numpy as np
+from evo.core.geometry import umeyama_alignment
 from PIL import Image
 
 from dataset import load_colmap, load_scannet
@@ -287,27 +288,10 @@ def estimate_similarity_umeyama(source_points, target_points):
         raise ValueError("Expected matched source/target point arrays with shape (N, 3)")
     if source.shape[0] < 3:
         raise ValueError("At least 3 matched points are required for Sim(3) scale")
-
-    source_mean = source.mean(axis=0)
-    target_mean = target.mean(axis=0)
-    source_centered = source - source_mean
-    target_centered = target - target_mean
-
-    covariance = target_centered.T @ source_centered / source.shape[0]
-    U, singular_values, Vt = np.linalg.svd(covariance)
-
-    sign = np.sign(np.linalg.det(U @ Vt))
-    correction = np.eye(3)
-    correction[-1, -1] = sign if sign != 0.0 else 1.0
-
-    rotation = U @ correction @ Vt
-    source_variance = np.sum(source_centered ** 2) / source.shape[0]
-    if source_variance <= 0.0:
+    if np.sum((source - source.mean(axis=0)) ** 2) <= 0.0:
         raise ValueError("COLMAP camera centers are degenerate; cannot estimate scale")
 
-    scale = np.trace(np.diag(singular_values) @ correction) / source_variance
-    translation = target_mean - scale * rotation @ source_mean
-
+    rotation, translation, scale = umeyama_alignment(source.T, target.T, with_scale=True)
     aligned = (scale * (rotation @ source.T)).T + translation
     errors = np.linalg.norm(aligned - target, axis=1)
 

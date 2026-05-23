@@ -47,7 +47,7 @@ def load_colmap(scene_dir):
     reconstruction = pycolmap.Reconstruction(scene_dir / "sparse" / "0")
 
     data = []
-    for image_id, image in reconstruction.images.items():
+    for _, image in reconstruction.images.items():
         camera = reconstruction.cameras[image.camera_id]
 
         model_name = camera.model.name

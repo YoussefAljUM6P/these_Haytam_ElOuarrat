@@ -4,7 +4,7 @@ import tempfile
 import numpy as np
 
 from camera import Camera
-from servo import FixedVelocityController, SimpleStopper, run_servo_loop
+from servo import FixedVelocityController, run_servo_loop
 
 
 class DummyScene:
@@ -28,25 +28,63 @@ class DummyMatcher:
 
 
 class ScriptedController:
-    """Returns a (residual, velocity) sequence for testing the stopper."""
+    """Returns a (residual, velocity) sequence for testing per-controller stops.
 
-    def __init__(self, residuals, velocities):
+    Supplies its own should_stop() with two configurable thresholds:
+        error_threshold       : stop when residual_norm < this value
+        velocity_grad_eps     : stop when ||v_i - v_{i-1}|| < this value
+    Either can be 0 to disable.
+    """
+
+    def __init__(
+        self,
+        residuals,
+        velocities,
+        error_threshold=0.0,
+        velocity_grad_eps=0.0,
+    ):
         if len(residuals) != len(velocities):
             raise ValueError("residuals and velocities must have same length")
         self.residuals = list(residuals)
         self.velocities = [np.asarray(v, dtype=np.float32) for v in velocities]
+        self.error_threshold = float(error_threshold)
+        self.velocity_grad_eps = float(velocity_grad_eps)
         self.last_info = {}
+        self._prev_velocity = None
+        self._last_velocity = None
 
     def __call__(self, rendered, target, camera, iteration):
         idx = min(iteration, len(self.residuals) - 1)
         residual = float(self.residuals[idx])
         velocity = self.velocities[idx].copy()
         self.last_info = {
+            "iteration": int(iteration),
             "residual_norm": residual,
             "velocity_norm": float(np.linalg.norm(velocity)),
             "num_inlier_matches": 12,
         }
+        self._prev_velocity = self._last_velocity
+        self._last_velocity = velocity.copy()
         return velocity
+
+    def should_stop(self):
+        residual = self.last_info.get("residual_norm")
+        if (
+            self.error_threshold > 0.0
+            and residual is not None
+            and np.isfinite(float(residual))
+            and float(residual) < self.error_threshold
+        ):
+            return "error_below_threshold"
+        if (
+            self.velocity_grad_eps > 0.0
+            and self._prev_velocity is not None
+            and self._last_velocity is not None
+        ):
+            grad = float(np.linalg.norm(self._last_velocity - self._prev_velocity))
+            if grad < self.velocity_grad_eps:
+                return "velocity_gradient_below_eps"
+        return None
 
 
 def main():
@@ -120,9 +158,10 @@ def main():
         ScriptedController(
             [5.0, 4.0, 0.5, 0.5, 0.5],
             [big_v, v_b, v_a, v_b, v_a],
+            error_threshold=1.0,
+            velocity_grad_eps=0.0,
         ),
         iterations=5,
-        early_stopper=SimpleStopper(error_threshold=1.0, velocity_grad_eps=0.0),
     )
     if error_stop["stop_reason"] != "error_below_threshold":
         raise AssertionError(
@@ -141,9 +180,10 @@ def main():
         ScriptedController(
             [5.0, 5.0, 5.0],
             [flat_v, flat_v, flat_v],
+            error_threshold=0.0,
+            velocity_grad_eps=1e-4,
         ),
         iterations=3,
-        early_stopper=SimpleStopper(error_threshold=0.0, velocity_grad_eps=1e-4),
     )
     if grad_stop["stop_reason"] != "velocity_gradient_below_eps":
         raise AssertionError(
@@ -162,9 +202,10 @@ def main():
         ScriptedController(
             [5.0, 5.0, 5.0],
             [v_a, v_b, v_a],
+            error_threshold=1.0,
+            velocity_grad_eps=1e-4,
         ),
         iterations=3,
-        early_stopper=SimpleStopper(error_threshold=1.0, velocity_grad_eps=1e-4),
     )
     if no_stop["stop_reason"] != "max_iterations":
         raise AssertionError(

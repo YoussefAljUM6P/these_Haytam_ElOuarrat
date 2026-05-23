@@ -24,8 +24,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
-
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
@@ -169,7 +167,7 @@ def main():
     color_map = {lab: _DEFAULT_COLORS[i % len(_DEFAULT_COLORS)]
                  for i, lab in enumerate(labels)}
 
-    def plot_modes(mode_name, mode, figsize, fname, title):
+    def plot_modes(mode, figsize, fname, title):
         fig = plt.figure(figsize=figsize)
         ax = plot.prepare_axis(fig, mode)
         plot.traj(ax, mode, traj_gt, "-", "green", label="GT")
@@ -183,9 +181,9 @@ def main():
         plt.close(fig)
         print(f"wrote {out_dir / fname}")
 
-    plot_modes("xyz", plot.PlotMode.xyz, (10, 8),
+    plot_modes(plot.PlotMode.xyz, (10, 8),
                "trajectory_xyz.png", "sim vs GT (3D)")
-    plot_modes("xy", plot.PlotMode.xy, (8, 8),
+    plot_modes(plot.PlotMode.xy, (8, 8),
                "trajectory_xy.png", "sim vs GT (top-down xy)")
 
     fig_err = plt.figure(figsize=(11, 4))

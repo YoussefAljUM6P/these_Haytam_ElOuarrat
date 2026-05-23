@@ -7,14 +7,22 @@ Implements the basic IBVS scheme:
     v_c = -lambda * pinv(L_e) * e                    (paper eq. 5)
 """
 
+from __future__ import annotations
+from typing import Optional, Union, Tuple, List, Dict, Callable, Any
+
 import cv2
 import numpy as np
+from numpy.typing import NDArray
+from scipy.stats import median_abs_deviation
+import torch
 
 from depth import get_depth
 from features import FeatureMatcher, filter_matches
+from camera import Camera
 
 
-def normalize_points(kpts, camera):
+
+def normalize_points(kpts: NDArray[np.float32], camera: Camera) -> NDArray[np.float32]:
     """Pixels -> normalized image coordinates (x, y) = ((u-cu)/f, (v-cv)/f)."""
     kpts = np.asarray(kpts, dtype=np.float32).reshape(-1, 2)
     center = np.array([camera.cx, camera.cy], dtype=np.float32)
@@ -22,7 +30,7 @@ def normalize_points(kpts, camera):
     return (kpts - center) * inv_focal
 
 
-def sample_depth_nearest(depth, kpts, min_depth=1e-4):
+def sample_depth_nearest(depth: NDArray[np.float32], kpts: NDArray[np.float32], min_depth: float = 1e-4) -> Tuple[NDArray[np.float32], NDArray[bool]]:
     depth = np.asarray(depth, dtype=np.float32)
     kpts = np.asarray(kpts, dtype=np.float32).reshape(-1, 2)
 
@@ -41,7 +49,7 @@ def sample_depth_nearest(depth, kpts, min_depth=1e-4):
     return values, valid
 
 
-def backproject_pixels(kpts, depths, camera):
+def backproject_pixels(kpts: NDArray[np.float32], depths: NDArray[np.float32], camera: Camera) -> NDArray[np.float32]:
     kpts = np.asarray(kpts, dtype=np.float32).reshape(-1, 2)
     depths = np.asarray(depths, dtype=np.float32).reshape(-1)
     if len(kpts) != len(depths):
@@ -54,14 +62,14 @@ def backproject_pixels(kpts, depths, camera):
     return points_cam
 
 
-def camera_points_to_world(points_cam, camera):
+def camera_points_to_world(points_cam: NDArray[np.float32], camera: Camera) -> NDArray[np.float32]:
     points_cam = np.asarray(points_cam, dtype=np.float32).reshape(-1, 3)
     R = camera.T_world_cam[:3, :3]
     t = camera.T_world_cam[:3, 3]
     return (points_cam @ R.T + t).astype(np.float32, copy=False)
 
 
-def project_world_points(points_world, camera, min_depth=1e-4):
+def project_world_points(points_world: NDArray[np.float32], camera: Camera, min_depth: float = 1e-4) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[bool]]:
     points_world = np.asarray(points_world, dtype=np.float32).reshape(-1, 3)
     R = camera.T_cam_world[:3, :3]
     t = camera.T_cam_world[:3, 3]
@@ -84,7 +92,7 @@ def project_world_points(points_world, camera, min_depth=1e-4):
     return pixels, depths.astype(np.float32, copy=False), valid
 
 
-def point_interaction_matrix(points, depths):
+def point_interaction_matrix(points: NDArray[np.float32], depths: NDArray[np.float32]) -> NDArray[np.float32]:
     """Stack per-point L_x (paper eq. 11). Input points are normalized (x, y)."""
     points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
     depths = np.asarray(depths, dtype=np.float32).reshape(-1)
@@ -116,7 +124,7 @@ def point_interaction_matrix(points, depths):
 # ----------------------------------------------------------------------------
 
 
-def image_to_gray(rgb_float01):
+def image_to_gray(rgb_float01: NDArray[np.float32]) -> NDArray[np.float32]:
     """RGB float in [0, 1] -> grayscale float32 (H, W)."""
     rgb = np.asarray(rgb_float01, dtype=np.float32)
     if rgb.ndim == 2:
@@ -128,7 +136,7 @@ def image_to_gray(rgb_float01):
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
 
-def gaussian_blur(image, sigma):
+def gaussian_blur(image: NDArray[np.float32], sigma: float) -> NDArray[np.float32]:
     """Isotropic Gaussian blur. Passthrough for sigma <= 0."""
     image = np.asarray(image, dtype=np.float32)
     if float(sigma) <= 0.0:
@@ -136,7 +144,7 @@ def gaussian_blur(image, sigma):
     return cv2.GaussianBlur(image, ksize=(0, 0), sigmaX=float(sigma))
 
 
-def gzn_transform(gray, sigma):
+def gzn_transform(gray: NDArray[np.float32], sigma: float) -> NDArray[np.float32]:
     """Gaussian + Zero-mean Normalization (Rodriguez Sensors 2020, eq. 1+2)."""
     gray = np.asarray(gray, dtype=np.float32)
     blurred = gaussian_blur(gray, sigma)
@@ -145,7 +153,7 @@ def gzn_transform(gray, sigma):
     return (blurred - mean) / (std + 1e-8)
 
 
-def image_gradient(gray):
+def image_gradient(gray: NDArray[np.float32]) -> Tuple[NDArray[np.float32], NDArray[np.float32]]:
     """Sobel ksize=3 spatial gradient, scaled to true derivative magnitude."""
     gray = np.asarray(gray, dtype=np.float32)
     # Sobel ksize=3 kernel sum on one side = 4; for symmetric derivative -> /8
@@ -154,7 +162,7 @@ def image_gradient(gray):
     return gx, gy
 
 
-def pixel_grid_normalized(camera):
+def pixel_grid_normalized(camera: Camera) -> Tuple[NDArray[np.float32], NDArray[np.float32]]:
     """(H, W) meshgrids of normalized image coords x=(u-cx)/fx, y=(v-cy)/fy."""
     u = np.arange(camera.W, dtype=np.float32)
     v = np.arange(camera.H, dtype=np.float32)
@@ -164,7 +172,7 @@ def pixel_grid_normalized(camera):
     return xn.astype(np.float32, copy=False), yn.astype(np.float32, copy=False)
 
 
-def photometric_interaction(gx, gy, xn, yn, z):
+def photometric_interaction(gx: NDArray[np.float32], gy: NDArray[np.float32], xn: NDArray[np.float32], yn: NDArray[np.float32], z: NDArray[np.float32]) -> NDArray[np.float32]:
     """Per-pixel luminance interaction matrix (RR-6631 eq. 9).
 
         L_I_i = -[gx_i, gy_i] @ L_x(xn_i, yn_i, z_i)
@@ -182,24 +190,22 @@ def photometric_interaction(gx, gy, xn, yn, z):
         raise ValueError("photometric_interaction: input length mismatch")
 
     points = np.stack([xn, yn], axis=1)
-    Lx_stacked = point_interaction_matrix(points, z)  # (2N, 6)
-    Lx = Lx_stacked.reshape(n, 2, 6)                  # (N, 2, 6)
-    # L_I = -[gx, gy] @ Lx  --> (N, 6)
-    grads = np.stack([gx, gy], axis=1)                # (N, 2)
-    L = -(grads[:, :, None] * Lx).sum(axis=1)
+    Lx = point_interaction_matrix(points, z).reshape(n, 2, 6)
+    grads = np.stack([gx, gy], axis=1)
+    L = -np.einsum('ni,nij->nj', grads, Lx)
     return L.astype(np.float32, copy=False)
 
 
 def build_pixel_mask(
-    I_star,
-    gx_star,
-    gy_star,
-    Z_star,
-    grad_percentile=50.0,
-    sat_lo=0.02,
-    sat_hi=0.98,
-    min_depth=1e-4,
-):
+    I_star: NDArray[np.float32],
+    gx_star: NDArray[np.float32],
+    gy_star: NDArray[np.float32],
+    Z_star: NDArray[np.float32],
+    grad_percentile: float = 50.0,
+    sat_lo: float = 0.02,
+    sat_hi: float = 0.98,
+    min_depth: float = 1e-4,
+) -> NDArray[bool]:
     """Boolean mask of pixels usable for photometric servo on the desired image.
 
     Drops: invalid/shallow depth, saturated intensity, low-gradient pixels.
@@ -230,7 +236,7 @@ def build_pixel_mask(
     return valid
 
 
-def huber_weights(residuals, k=None):
+def huber_weights(residuals: NDArray[np.float32], k: Optional[float] = None) -> Tuple[NDArray[np.float32], float]:
     """Huber re-weighting w_i = 1 if |r| <= k else k / |r|.
 
     If `k` is None, derive k = 1.345 * 1.4826 * MAD(residuals).
@@ -238,9 +244,7 @@ def huber_weights(residuals, k=None):
     r = np.asarray(residuals, dtype=np.float32).reshape(-1)
     abs_r = np.abs(r)
     if k is None:
-        med = float(np.median(r))
-        mad = float(np.median(np.abs(r - med)))
-        k = 1.345 * 1.4826 * max(mad, 1e-6)
+        k = 1.345 * max(float(median_abs_deviation(r, scale="normal")), 1e-6)
     k = float(k)
     w = np.ones_like(abs_r)
     big = abs_r > k
@@ -259,19 +263,20 @@ class IBVSController:
 
     def __init__(
         self,
-        matcher=None,
-        feature_method="xfeat",
-        gain=0.5,
-        min_features=3,
-        min_depth=1e-4,
-        depth_provider=None,
-        scene=None,
-        use_intrinsic_depth=False,
-        ratio=1,
-        damping=0.01,
-        adaptive_gain=True,
-        velocity_alpha=0.8,
-    ):
+        matcher: Optional[FeatureMatcher] = None,
+        feature_method: str = "xfeat",
+        gain: float = 0.5,
+        min_features: int = 3,
+        min_depth: float = 1e-4,
+        depth_provider: Optional[Callable[[NDArray[np.float32]], NDArray[np.float32]]] = None,
+        scene: Optional[Any] = None,
+        use_intrinsic_depth: bool = False,
+        ratio: int = 1,
+        damping: float = 0.01,
+        adaptive_gain: bool = True,
+        velocity_alpha: float = 0.8,
+        stop_residual_px: float = 0.5,
+    ) -> None:
         if int(ratio) < 0:
             raise ValueError("ratio must be >= 0")
         self.matcher = matcher if matcher is not None else FeatureMatcher(method=feature_method)
@@ -285,6 +290,9 @@ class IBVSController:
         self.damping = float(damping)
         self.adaptive_gain = bool(adaptive_gain)
         self.velocity_alpha = float(velocity_alpha)
+        # Stop when per-feature mean pixel error (RMS over 2N components) drops
+        # below this threshold. Default 0.5 px ~ subpixel agreement.
+        self.stop_residual_px = float(stop_residual_px)
 
         self.cached_points_world = None
         self.cached_target_kpts = None
@@ -293,7 +301,7 @@ class IBVSController:
         self.last_visualization = {}
         self.prev_velocity = None
 
-    def _depth(self, rendered):
+    def _depth(self, rendered: NDArray[np.float32]) -> NDArray[np.float32]:
         if self.depth_provider is not None:
             return np.asarray(self.depth_provider(rendered), dtype=np.float32)
         return get_depth(
@@ -302,14 +310,14 @@ class IBVSController:
             use_intrinsic=self.use_intrinsic_depth,
         )
 
-    def _should_refresh(self, iteration):
+    def _should_refresh(self, iteration: int) -> bool:
         if self.cached_points_world is None:
             return True
         if self.ratio == 0:
             return False
         return int(iteration) % self.ratio == 0
 
-    def _refresh(self, rendered, target, camera, iteration):
+    def _refresh(self, rendered: NDArray[np.float32], target: NDArray[np.float32], camera: Camera, iteration: int) -> Dict[str, Any]:
         kpts_current, kpts_target = self.matcher.match(rendered, target)
         num_raw = len(kpts_current)
         kpts_current, kpts_target, _, _, _, _ = filter_matches(
@@ -348,7 +356,7 @@ class IBVSController:
             "num_dropped_features": 0,
         }
 
-    def _reproject(self, rendered, camera):
+    def _reproject(self, rendered: NDArray[np.float32], camera: Camera) -> Dict[str, Any]:
         cached_before = len(self.cached_points_world)
         kpts_current, depths_geom, valid = project_world_points(
             self.cached_points_world,
@@ -390,7 +398,7 @@ class IBVSController:
             "num_dropped_features": int(cached_before - len(kpts_current)),
         }
 
-    def __call__(self, rendered, target, camera, iteration):
+    def __call__(self, rendered: NDArray[np.float32], target: NDArray[np.float32], camera: Camera, iteration: int) -> NDArray[np.float32]:
         if self._should_refresh(iteration):
             state = self._refresh(rendered, target, camera, iteration)
         else:
@@ -411,6 +419,8 @@ class IBVSController:
         # Control law: v_c = -lambda * pinv(L_e) * e (paper eq. 5).
         velocity = (-self.gain * (np.linalg.pinv(L) @ error)).astype(np.float32)
 
+        n_components = max(int(error.size), 1)
+        residual_norm = float(np.linalg.norm(error))
         self.last_info = {
             "iteration": int(iteration),
             "feature_mode": state["mode"],
@@ -420,7 +430,8 @@ class IBVSController:
             "num_inlier_matches": int(len(kpts_current)),
             "num_cached_features": int(len(self.cached_points_world)),
             "num_dropped_features": state["num_dropped_features"],
-            "residual_norm": float(np.linalg.norm(error)),
+            "residual_norm": residual_norm,
+            "residual_rms_px": residual_norm / float(np.sqrt(n_components)),
             "velocity_norm": float(np.linalg.norm(velocity)),
             "mean_depth_m": float(np.mean(depths)),
             "min_depth_m": float(np.min(depths)),
@@ -434,6 +445,35 @@ class IBVSController:
             "kpts_target": kpts_target.copy(),
         }
         return velocity
+
+    def should_stop(self) -> Optional[str]:
+        """Stop when RMS feature reprojection error <= stop_residual_px."""
+        rms = self.last_info.get("residual_rms_px")
+        if rms is None or not np.isfinite(float(rms)):
+            return None
+        if float(rms) <= self.stop_residual_px:
+            return "ibvs_rms_below_threshold"
+        return None
+
+    def feature_error_px(
+        self,
+        rendered: NDArray[np.float32],
+        target: NDArray[np.float32],
+        camera: Camera,
+    ) -> float:
+        """Return ||kpts_current - kpts_target||_2 over filtered correspondences.
+
+        Used by the trajectory runner to compute the paper's w(i) ratio for
+        dynamic iteration scheduling (eq. 7). Does not require depth — only
+        2D pixel coordinates. Returns 0.0 if fewer than `min_features` match.
+        """
+        kpts_current, kpts_target = self.matcher.match(rendered, target)
+        kpts_current, kpts_target, _, _, _, _ = filter_matches(
+            kpts_current, kpts_target, camera,
+        )
+        if len(kpts_current) < self.min_features:
+            return 0.0
+        return float(np.linalg.norm((kpts_current - kpts_target).reshape(-1)))
 
 
 class PhotometricController:
@@ -454,22 +494,23 @@ class PhotometricController:
 
     def __init__(
         self,
-        scene,
-        target_camera=None,
-        gain=0.5,
-        sigma_blur=1.0,
-        use_gzn=True,
-        grad_percentile=50.0,
-        sat_lo=0.02,
-        sat_hi=0.98,
-        min_depth=1e-4,
-        max_pixels=50_000,
-        use_huber=True,
-        huber_k=None,
-        use_intrinsic_depth=True,
-        depth_provider=None,
-        seed=0,
-    ):
+        scene: Any,
+        target_camera: Optional[Camera] = None,
+        gain: float = 0.5,
+        sigma_blur: float = 1.0,
+        use_gzn: bool = True,
+        grad_percentile: float = 50.0,
+        sat_lo: float = 0.02,
+        sat_hi: float = 0.98,
+        min_depth: float = 1e-4,
+        max_pixels: int = 50_000,
+        use_huber: bool = True,
+        huber_k: Optional[float] = None,
+        use_intrinsic_depth: bool = True,
+        depth_provider: Optional[Callable[[NDArray[np.float32]], NDArray[np.float32]]] = None,
+        seed: int = 0,
+        stop_mse_per_px: float = 2.0e-6,
+    ) -> None:
         if scene is None and depth_provider is None:
             raise ValueError(
                 "PhotometricController needs `scene` (with render_depth) "
@@ -489,6 +530,10 @@ class PhotometricController:
         self.huber_k = None if huber_k is None else float(huber_k)
         self.use_intrinsic_depth = bool(use_intrinsic_depth)
         self.depth_provider = depth_provider
+        # ViSP-style stop: per-pixel mean square intensity error below
+        # threshold. Default ~2e-6 matches `SSD>10000` on 320x240 [0,255]
+        # when our intensities live in [0,1] (10000 / 255^2 / 76800).
+        self.stop_mse_per_px = float(stop_mse_per_px)
 
         self._rng = np.random.default_rng(int(seed))
 
@@ -511,12 +556,12 @@ class PhotometricController:
 
     # -- public ----------------------------------------------------------------
 
-    def set_target_camera(self, camera):
+    def set_target_camera(self, camera: Camera) -> None:
         """Provide / replace the desired-pose camera. Invalidates the cache."""
         self.target_camera = camera
         self._cached_target_id = None
 
-    def __call__(self, rendered, target, camera, iteration):
+    def __call__(self, rendered: NDArray[np.float32], target: NDArray[np.float32], camera: Camera, iteration: int) -> NDArray[np.float32]:
         self._ensure_camera_grid(camera)
 
         if self._cached_target_id != id(target) or int(iteration) == 0:
@@ -560,6 +605,10 @@ class PhotometricController:
             "num_cached_features": n_used,
             "num_dropped_features": int(self._num_total_valid - n_used),
             "residual_norm": float(np.linalg.norm(e)),
+            "residual_ssd": float(np.square(e).sum()),
+            "residual_mse_per_px": (
+                float(np.square(e).mean()) if e.size else 0.0
+            ),
             "velocity_norm": float(np.linalg.norm(velocity)),
             "mean_depth_m": mean_d,
             "min_depth_m": min_d,
@@ -578,6 +627,15 @@ class PhotometricController:
         }
         return velocity
 
+    def should_stop(self) -> Optional[str]:
+        """ViSP-style stop: mean(e^2) per pixel <= stop_mse_per_px."""
+        mse = self.last_info.get("residual_mse_per_px")
+        if mse is None or not np.isfinite(float(mse)):
+            return None
+        if float(mse) <= self.stop_mse_per_px:
+            return "photometric_mse_below_threshold"
+        return None
+
     # -- internals -------------------------------------------------------------
 
     def _depth(self, image, camera=None):
@@ -591,7 +649,7 @@ class PhotometricController:
             )
         return get_depth(image, scene=self.scene, use_intrinsic=False)
 
-    def _ensure_camera_grid(self, camera):
+    def _ensure_camera_grid(self, camera: Camera) -> None:
         key = (camera.fx, camera.fy, camera.cx, camera.cy, camera.H, camera.W)
         if self._camera_grid_key == key:
             return
@@ -600,13 +658,13 @@ class PhotometricController:
         # Intrinsics changed -> any cached target state is stale.
         self._cached_target_id = None
 
-    def _preprocess(self, rgb):
+    def _preprocess(self, rgb: NDArray[np.float32]) -> NDArray[np.float32]:
         gray = image_to_gray(rgb)
         if self.use_gzn:
             return gzn_transform(gray, self.sigma_blur)
         return gaussian_blur(gray, self.sigma_blur)
 
-    def _build_target_cache(self, target):
+    def _build_target_cache(self, target: NDArray[np.float32]) -> None:
         if self.target_camera is None:
             raise RuntimeError(
                 "PhotometricController requires a target_camera (pass via "
@@ -656,7 +714,7 @@ class PhotometricController:
         self._mask_idx = idx
         self._cached_target_id = id(target)
 
-    def _compute_residual_and_L(self, rendered):
+    def _compute_residual_and_L(self, rendered: NDArray[np.float32]) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
         I_cur = self._preprocess(rendered)
         gx_cur, gy_cur = image_gradient(I_cur)
 

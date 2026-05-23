@@ -12,11 +12,14 @@ returns one row of L per pixel:
 """
 
 from __future__ import annotations
+from typing import Optional, Union, Tuple, List, Dict, Callable, Any
+from numpy.typing import NDArray
+import numpy as np
 
 import torch
 
 
-def point_interaction_matrix(x, y, z):
+def point_interaction_matrix(x: Union[torch.Tensor, NDArray[Any]], y: Union[torch.Tensor, NDArray[Any]], z: Union[torch.Tensor, NDArray[Any]]) -> torch.Tensor:
     """Per-point IBVS interaction matrix.
 
     Inputs are 1-D tensors of normalized image coords (x, y) and depth Z.
@@ -30,7 +33,6 @@ def point_interaction_matrix(x, y, z):
             f"shape mismatch x={tuple(x.shape)} y={tuple(y.shape)} z={tuple(z.shape)}"
         )
 
-    n = x.numel()
     inv_z = 1.0 / z
     zero = torch.zeros_like(x)
     one = torch.ones_like(x)
@@ -47,7 +49,7 @@ def point_interaction_matrix(x, y, z):
     return L
 
 
-def luminance_interaction(gx, gy, x, y, z):
+def luminance_interaction(gx: Union[torch.Tensor, NDArray[Any]], gy: Union[torch.Tensor, NDArray[Any]], x: Union[torch.Tensor, NDArray[Any]], y: Union[torch.Tensor, NDArray[Any]], z: Union[torch.Tensor, NDArray[Any]]) -> torch.Tensor:
     """Per-pixel luminance interaction matrix L_I_i = -[gx gy] L_x.
 
     All inputs are 1-D tensors of equal length. Returns (N, 6) float32.

@@ -12,7 +12,6 @@ Use via the CLI:
 
 import csv
 import json
-import re
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -21,9 +20,9 @@ from runners.servo_frames import (
     PROJECT_ROOT,
     RUNS_ROOT,
     camera_metadata,
+    frame_id_from_path,
     load_rgb,
     rotation_error_from_pose,
-    save_rgb,
     sorted_frame_ids,
     translation_error_from_pose,
 )
@@ -48,11 +47,33 @@ MIN_FEATURES = 3
 RATIO = 1
 START_INDEX = 1
 MAX_PAIRS = None
-EARLY_STOP_ERROR_THRESHOLD = 1e-5
-EARLY_STOP_VELOCITY_GRAD_EPS = 1e-8
+STOP_RESIDUAL_PX = 0.5      # IBVS: RMS reprojection error (px)
+STOP_MSE_PER_PX = 2.0e-6    # photometric: mean(e^2) per pixel on [0, 1] floats
 RPE_DELTA = 1
 SAVE_TASK_VIZ = True
 TASK_VIZ_EVERY = 1
+
+# Dynamic iteration schedule for IBVS launches (paper eq. 7):
+#     N(w) = N1                if w > 1
+#          = N1 / 3            if w < 1/3
+#          = round(w * N1)     otherwise
+# where w(i) = ||n_r_i - n_q_i||_2 / ||n_r_1 - n_q_1||_2 over filtered
+# correspondences (pixels). Disabled for non-IBVS controllers.
+DYNAMIC_IBVS_ITERS = True
+
+
+def _dynamic_n_iter(w: float, n1: int) -> int:
+    """Paper eq. 7. N1 is the first-launch iter count."""
+    n1 = int(n1)
+    if n1 <= 0:
+        return 0
+    if not (w == w):  # NaN guard
+        return n1
+    if w > 1.0:
+        return n1
+    if w < 1.0 / 3.0:
+        return max(1, n1 // 3)
+    return max(1, int(round(w * n1)))
 
 CONTROLLER = "ibvs"
 SIGMA_BLUR = 1.0
@@ -89,13 +110,6 @@ def add_arguments(parser):
             "specific run dir."
         ),
     )
-
-
-def frame_id_from_path(path):
-    match = re.search(r"(\d+)", Path(path).name)
-    if match is None:
-        raise ValueError(f"Could not parse frame id from {path!r}")
-    return f"frame-{int(match.group(1)):06d}"
 
 
 def make_frame_index(records):
@@ -364,24 +378,21 @@ PER_TASK_FIELDS = [
     "target_frame",
     "src_rgb",
     "target_rgb",
+    "iterations_planned",
     "iterations_run",
+    "dynamic_w",
+    "feature_err_px",
     "stop_reason",
     "translation_error_m",
     "rotation_error_deg",
+    "fps",
+    "render_fps",
+    "iter_ms_mean",
+    "render_ms_mean",
+    "controller_ms_mean",
+    "loop_s",
     "viz_path",
 ]
-
-
-def write_per_task_csv(path, rows):
-    if not rows:
-        return
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=PER_TASK_FIELDS)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({k: row.get(k, "") for k in PER_TASK_FIELDS})
 
 
 def append_task_row(path, row):
@@ -454,7 +465,7 @@ def run_scene(scene_name, run_root, resume=False):
     from controllers import IBVSController, PhotometricController
     from features import FeatureMatcher
     from photometric import PhotometricControllerTorch
-    from servo import SimpleStopper, copy_camera_with_pose, run_servo_loop
+    from servo import copy_camera_with_pose, run_servo_loop
     from viz import save_side_by_side
 
     scene_dir = PROJECT_ROOT / "DATA" / scene_name
@@ -482,6 +493,7 @@ def run_scene(scene_name, run_root, resume=False):
             scene=scene,
             use_intrinsic_depth=(DEPTH_MODE == "intrinsic"),
             ratio=RATIO,
+            stop_residual_px=STOP_RESIDUAL_PX,
         )
     elif CONTROLLER == "photometric":
         controller = PhotometricController(
@@ -495,6 +507,7 @@ def run_scene(scene_name, run_root, resume=False):
             use_huber=USE_HUBER,
             huber_k=HUBER_K,
             use_intrinsic_depth=(DEPTH_MODE == "intrinsic"),
+            stop_mse_per_px=STOP_MSE_PER_PX,
         )
     elif CONTROLLER == "photometric_torch":
         controller = PhotometricControllerTorch(
@@ -509,6 +522,7 @@ def run_scene(scene_name, run_root, resume=False):
             huber_k=HUBER_K,
             use_intrinsic_depth=(DEPTH_MODE == "intrinsic"),
             method="lm",
+            stop_mse_per_px=STOP_MSE_PER_PX,
         )
     else:
         raise ValueError(f"Unknown CONTROLLER={CONTROLLER!r}")
@@ -532,7 +546,7 @@ def run_scene(scene_name, run_root, resume=False):
     if resume and sim_tum.exists() and gt_tum.exists() and csv_path.exists():
         prev_rows = read_per_task_csv(csv_path)
         sim_ts, sim_loaded = read_tum(sim_tum)
-        gt_ts, gt_loaded = read_tum(gt_tum)
+        _, gt_loaded = read_tum(gt_tum)
         expected = len(prev_rows) + 1
         if len(sim_loaded) != expected or len(gt_loaded) != expected:
             raise RuntimeError(
@@ -558,6 +572,8 @@ def run_scene(scene_name, run_root, resume=False):
             write_tum(sim_tum, timestamps, sim_poses)
             write_tum(gt_tum, timestamps, gt_poses)
 
+    baseline_feature_err_px = None  # ||n_r_1 - n_q_1||_2 for dynamic schedule
+
     for task_idx, task in enumerate(tasks):
         if task_idx < resume_offset:
             continue
@@ -572,6 +588,7 @@ def run_scene(scene_name, run_root, resume=False):
                 src_frame["camera"],
                 src_frame["camera"].T_world_cam.copy(),
             )
+            baseline_feature_err_px = None  # restart paper schedule on reset
 
         target_image = load_rgb(
             tgt_frame["rgb_path"],
@@ -580,10 +597,22 @@ def run_scene(scene_name, run_root, resume=False):
         )
         if isinstance(controller, (PhotometricController, PhotometricControllerTorch)):
             controller.set_target_camera(target_camera)
-        stopper = SimpleStopper(
-            error_threshold=EARLY_STOP_ERROR_THRESHOLD,
-            velocity_grad_eps=EARLY_STOP_VELOCITY_GRAD_EPS,
-        )
+
+        # Paper eq. 7: dynamically choose iter count for this IBVS launch.
+        iters_for_task = int(MINI_ITERATIONS)
+        dynamic_w = float("nan")
+        feature_err_px = float("nan")
+        if DYNAMIC_IBVS_ITERS and isinstance(controller, IBVSController):
+            pre_render = scene.render(current_camera)
+            feature_err_px = controller.feature_error_px(
+                pre_render, target_image, current_camera,
+            )
+            if baseline_feature_err_px is None or baseline_feature_err_px <= 1e-6:
+                baseline_feature_err_px = feature_err_px
+                dynamic_w = 1.0
+            else:
+                dynamic_w = feature_err_px / baseline_feature_err_px
+            iters_for_task = _dynamic_n_iter(dynamic_w, MINI_ITERATIONS)
 
         try:
             result = run_servo_loop(
@@ -591,13 +620,12 @@ def run_scene(scene_name, run_root, resume=False):
                 current_camera,
                 target_image,
                 controller,
-                iterations=MINI_ITERATIONS,
+                iterations=iters_for_task,
                 dt=DT,
                 visualization_dir=None,
                 matcher=matcher,
                 feature_method=FEATURE_METHOD,
                 iteration_callback=None,
-                early_stopper=stopper,
                 viz_iter=0,
             )
         except Exception as e:
@@ -645,6 +673,7 @@ def run_scene(scene_name, run_root, resume=False):
             task_viz_path = viz_dir / f"task_{task_idx:04d}_final_vs_target.png"
             save_side_by_side(final_render, target_image, task_viz_path)
 
+        timing = result.get("timing", {}) or {}
         task_row = {
             "task_index": task_idx,
             "sequence_reset": int(bool(task["reset"])),
@@ -652,10 +681,19 @@ def run_scene(scene_name, run_root, resume=False):
             "target_frame": tgt_frame_id,
             "src_rgb": str(frame_index[src_frame_id]["rgb_path"]),
             "target_rgb": str(tgt_frame["rgb_path"]),
+            "iterations_planned": int(iters_for_task),
             "iterations_run": int(len(result["history"])),
+            "dynamic_w": float(dynamic_w),
+            "feature_err_px": float(feature_err_px),
             "stop_reason": result["stop_reason"],
             "translation_error_m": float(translation_err),
             "rotation_error_deg": float(rotation_err),
+            "fps": float(timing.get("fps", 0.0)),
+            "render_fps": float(timing.get("render_fps", 0.0)),
+            "iter_ms_mean": float(timing.get("iter_ms_mean", 0.0)),
+            "render_ms_mean": float(timing.get("render_ms_mean", 0.0)),
+            "controller_ms_mean": float(timing.get("controller_ms_mean", 0.0)),
+            "loop_s": float(timing.get("loop_s", 0.0)),
             "viz_path": str(task_viz_path) if task_viz_path is not None else "",
         }
         per_task_rows.append(task_row)
@@ -667,9 +705,12 @@ def run_scene(scene_name, run_root, resume=False):
         print(
             f"[{scene_name}] task {task_idx:04d}: "
             f"{src_frame_id} -> {tgt_frame_id} "
-            f"iters={len(result['history'])}/{MINI_ITERATIONS} "
-            f"trans_err={translation_err * 1000.0:.4f}mm "
-            f"rot_err={rotation_err:.8e}deg"
+            f"iters={len(result['history'])}/{iters_for_task}/{MINI_ITERATIONS} "
+            f"w={dynamic_w:.3f} feat_err_px={feature_err_px:.2f} "
+            f"trans_err={translation_err * 1000.0:.4f} "
+            f"rot_err={rotation_err:.8e} "
+            f"fps={task_row['fps']:.1f} "
+            f"render_ms={task_row['render_ms_mean']:.2f}"
         )
 
         current_camera = copy_camera_with_pose(target_camera, sim_T)
@@ -705,8 +746,8 @@ def run_scene(scene_name, run_root, resume=False):
         "ratio": int(RATIO),
         "start_index": int(START_INDEX),
         "max_pairs": MAX_PAIRS,
-        "early_stop_error_threshold": float(EARLY_STOP_ERROR_THRESHOLD),
-        "early_stop_velocity_grad_eps": float(EARLY_STOP_VELOCITY_GRAD_EPS),
+        "stop_residual_px": float(STOP_RESIDUAL_PX),
+        "stop_mse_per_px": float(STOP_MSE_PER_PX),
         "save_task_viz": bool(SAVE_TASK_VIZ),
         "task_viz_every": int(TASK_VIZ_EVERY),
         "num_tasks": len(per_task_rows),

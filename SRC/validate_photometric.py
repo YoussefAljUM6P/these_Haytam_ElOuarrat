@@ -372,7 +372,7 @@ def _try_sim_to_sim():
         scene, start_cam, target_image, ctrl,
         iterations=200, dt=1.0,
         visualization_dir=None, matcher=None,
-        iteration_callback=None, early_stopper=None,
+        iteration_callback=None,
         viz_iter=0,
     )
     final_cam = result["camera"]

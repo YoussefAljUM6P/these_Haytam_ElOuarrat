@@ -2,7 +2,6 @@
   "kind": "servo_frames",
   "scene_dir": "kitchen",
   "renderer": "mesh",
-  "nerf_pose_source": "colmap",
   "start_index": 1,
   "index_away": 1,
   "target_index": null,
@@ -15,6 +14,6 @@
   "min_features": 3,
   "ratio": 1,
   "run_name": null,
-  "early_stop_error_threshold": 0.00001,
-  "early_stop_velocity_grad_eps": 0.00000001
+  "stop_residual_px": 0.5,
+  "stop_mse_per_px": 2e-06
 }

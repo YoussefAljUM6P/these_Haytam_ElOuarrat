@@ -73,10 +73,6 @@ class Condition:
     def slug(self):
         return slugify(f"{self.scene.label}_{self.depth.label}_{self.matcher.label}")
 
-    @property
-    def column_label(self):
-        return f"{self.scene.label} / {self.depth.label} / {self.matcher.label}"
-
 
 SCENES = (
     SceneSpec("GS", "gs"),

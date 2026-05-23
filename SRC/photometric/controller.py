@@ -10,17 +10,21 @@ controller:
 """
 
 from __future__ import annotations
+from typing import Optional, Union, Tuple, List, Dict, Callable, Any
 
 import numpy as np
+from numpy.typing import NDArray
 import torch
 
 from depth import get_depth
+from camera import Camera
+
 
 from .feature import FeatureLuminance
 from .servo import PhotometricServo
 
 
-def _to_numpy(t):
+def _to_numpy(t: Union[torch.Tensor, NDArray[Any]]) -> NDArray[Any]:
     if isinstance(t, torch.Tensor):
         return t.detach().cpu().numpy()
     return np.asarray(t)
@@ -36,27 +40,28 @@ class PhotometricControllerTorch:
 
     def __init__(
         self,
-        scene,
-        target_camera=None,
-        gain=0.5,
-        sigma_blur=1.0,
-        use_gzn=True,
-        bord=10,
-        grad_percentile=0.0,
-        sat_lo=0.02,
-        sat_hi=0.98,
-        min_depth=1e-4,
-        max_pixels=50_000,
-        use_huber=True,
-        huber_k=None,
-        use_intrinsic_depth=True,
-        depth_provider=None,
-        method="lm",
-        mu_init=0.01,
-        damping=1e-9,
-        device=None,
-        seed=0,
-    ):
+        scene: Any,
+        target_camera: Optional[Camera] = None,
+        gain: float = 0.5,
+        sigma_blur: float = 1.0,
+        use_gzn: bool = True,
+        bord: int = 10,
+        grad_percentile: float = 0.0,
+        sat_lo: float = 0.02,
+        sat_hi: float = 0.98,
+        min_depth: float = 1e-4,
+        max_pixels: int = 50_000,
+        use_huber: bool = True,
+        huber_k: Optional[float] = None,
+        use_intrinsic_depth: bool = True,
+        depth_provider: Optional[Callable[[NDArray[np.float32]], NDArray[np.float32]]] = None,
+        method: str = "lm",
+        mu_init: float = 0.01,
+        damping: float = 1e-9,
+        device: Optional[str] = None,
+        seed: int = 0,
+        stop_mse_per_px: float = 2.0e-6,
+    ) -> None:
         if scene is None and depth_provider is None:
             raise ValueError(
                 "PhotometricControllerTorch needs `scene` (with render_depth) "
@@ -76,6 +81,11 @@ class PhotometricControllerTorch:
         self.depth_provider = depth_provider
         self.seed = int(seed)
         self.device = torch.device(device) if device is not None else torch.device("cpu")
+        # Stop when mean(e^2) per pixel falls below this threshold (ViSP-style
+        # stop, expressed resolution-free on whatever intensity scale the
+        # feature uses; for [0,1] floats the ViSP equivalent of `SSD>10000` on
+        # [0,255] over 320x240 is ~2e-6).
+        self.stop_mse_per_px = float(stop_mse_per_px)
 
         self.servo = PhotometricServo(
             gain=gain,
@@ -93,13 +103,22 @@ class PhotometricControllerTorch:
 
     # -- public API --------------------------------------------------------
 
-    def set_target_camera(self, camera):
+    def should_stop(self) -> Optional[str]:
+        """ViSP-style stop: residual mean square per pixel <= threshold."""
+        mse = self.last_info.get("residual_mse_per_px")
+        if mse is None or not np.isfinite(float(mse)):
+            return None
+        if float(mse) <= self.stop_mse_per_px:
+            return "photometric_mse_below_threshold"
+        return None
+
+    def set_target_camera(self, camera: Camera) -> None:
         self.target_camera = camera
         self._cached_target_id = None
         self._feature = None
         self.servo.reset()
 
-    def __call__(self, rendered, target, camera, iteration):
+    def __call__(self, rendered: NDArray[np.float32], target: NDArray[np.float32], camera: Camera, iteration: int) -> NDArray[np.float32]:
         if self._cached_target_id != id(target) or self._feature is None:
             self._build_feature(target)
 
@@ -128,6 +147,8 @@ class PhotometricControllerTorch:
             "num_cached_features": n_used,
             "num_dropped_features": int(feature.num_total_valid - n_used),
             "residual_norm": solver_info["residual_norm"],
+            "residual_ssd": solver_info["residual_ssd"],
+            "residual_mse_per_px": solver_info["residual_mse_per_px"],
             "velocity_norm": float(np.linalg.norm(velocity)),
             "mean_depth_m": mean_d,
             "min_depth_m": min_d,
@@ -150,7 +171,7 @@ class PhotometricControllerTorch:
 
     # -- internals ---------------------------------------------------------
 
-    def _build_feature(self, target):
+    def _build_feature(self, target: NDArray[np.float32]) -> None:
         if self.target_camera is None:
             raise RuntimeError(
                 "PhotometricControllerTorch requires a target_camera (pass via "
@@ -182,7 +203,7 @@ class PhotometricControllerTorch:
         self._cached_target_id = id(target)
         self.servo.reset()
 
-    def _depth(self, image, camera=None):
+    def _depth(self, image: NDArray[np.float32], camera: Optional[Camera] = None) -> NDArray[np.float32]:
         if self.depth_provider is not None:
             return np.asarray(self.depth_provider(image), dtype=np.float32)
         if self.use_intrinsic_depth:

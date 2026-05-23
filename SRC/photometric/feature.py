@@ -9,8 +9,13 @@ luminance interaction matrix.
 """
 
 from __future__ import annotations
+from typing import Optional, Union, Tuple, List, Dict, Callable, Any
 
+import numpy as np
+from numpy.typing import NDArray
 import torch
+
+from camera import Camera
 
 from .filter import (
     border_mask,
@@ -22,7 +27,7 @@ from .filter import (
 from .interaction import luminance_interaction
 
 
-def _gzn(gray, sigma):
+def _gzn(gray: torch.Tensor, sigma: float) -> torch.Tensor:
     """Gaussian + zero-mean normalization (Rodriguez Sensors 2020)."""
     blurred = gaussian_blur(gray, sigma)
     mean = blurred.mean()
@@ -30,14 +35,14 @@ def _gzn(gray, sigma):
     return (blurred - mean) / std
 
 
-def _preprocess(image, sigma_blur, use_gzn):
+def _preprocess(image: Union[torch.Tensor, NDArray[np.float32]], sigma_blur: float, use_gzn: bool) -> torch.Tensor:
     gray = rgb_to_gray(image)
     if use_gzn:
         return _gzn(gray, sigma_blur)
     return gaussian_blur(gray, sigma_blur)
 
 
-def _pixel_grid_normalized(H, W, fx, fy, cx, cy, device, dtype=torch.float32):
+def _pixel_grid_normalized(H: int, W: int, fx: float, fy: float, cx: float, cy: float, device: torch.device, dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
     u = torch.arange(W, device=device, dtype=dtype)
     v = torch.arange(H, device=device, dtype=dtype)
     vv, uu = torch.meshgrid(v, u, indexing="ij")
@@ -56,20 +61,20 @@ class FeatureLuminance:
 
     def __init__(
         self,
-        camera,
-        target_image,
-        depth_star,
-        sigma_blur=1.0,
-        use_gzn=True,
-        bord=10,
-        grad_percentile=0.0,
-        sat_lo=float("-inf"),
-        sat_hi=float("inf"),
-        min_depth=1e-4,
-        max_pixels=0,
-        device=None,
-        seed=0,
-    ):
+        camera: Camera,
+        target_image: Union[torch.Tensor, NDArray[np.float32]],
+        depth_star: Union[torch.Tensor, NDArray[np.float32]],
+        sigma_blur: float = 1.0,
+        use_gzn: bool = True,
+        bord: int = 10,
+        grad_percentile: float = 0.0,
+        sat_lo: float = float("-inf"),
+        sat_hi: float = float("inf"),
+        min_depth: float = 1e-4,
+        max_pixels: int = 0,
+        device: Optional[Union[str, torch.device]] = None,
+        seed: int = 0,
+    ) -> None:
         self.device = torch.device(device) if device is not None else torch.device("cpu")
         self.sigma_blur = float(sigma_blur)
         self.use_gzn = bool(use_gzn)
@@ -130,29 +135,28 @@ class FeatureLuminance:
         self._gx_cur = None
         self._gy_cur = None
         self._shape = (H, W)
-        self._camera_intrinsics = (camera.fx, camera.fy, camera.cx, camera.cy)
 
     @property
-    def num_pixels(self):
+    def num_pixels(self) -> int:
         return int(self._idx.numel())
 
     @property
-    def num_total_valid(self):
+    def num_total_valid(self) -> int:
         return self._num_total_valid
 
     @property
-    def shape(self):
+    def shape(self) -> Tuple[int, int]:
         return self._shape
 
     @property
-    def I_star(self):
+    def I_star(self) -> torch.Tensor:
         return self._I_star
 
     @property
-    def Z_star(self):
+    def Z_star(self) -> torch.Tensor:
         return self._Z_star
 
-    def build_from(self, image):
+    def build_from(self, image: Union[torch.Tensor, NDArray[np.float32]]) -> torch.Tensor:
         I_cur = _preprocess(image, self.sigma_blur, self.use_gzn).to(self.device)
         if I_cur.shape != self._shape:
             raise ValueError(
@@ -163,12 +167,12 @@ class FeatureLuminance:
         self._gy_cur = derivative_filter_y(I_cur).reshape(-1)[self._idx]
         return self._I_cur
 
-    def error(self):
+    def error(self) -> torch.Tensor:
         if self._I_cur is None:
             raise RuntimeError("FeatureLuminance.error() called before build_from()")
         return self._I_cur - self._I_star
 
-    def interaction(self):
+    def interaction(self) -> torch.Tensor:
         """L_I built from current Ix, Iy and cached x*, y*, Z* (desired-side depth)."""
         if self._gx_cur is None:
             raise RuntimeError("FeatureLuminance.interaction() called before build_from()")

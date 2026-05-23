@@ -33,8 +33,9 @@ TRAJECTORY_CONFIG_KEYS = {
     "ratio": "RATIO",
     "start_index": "START_INDEX",
     "max_pairs": "MAX_PAIRS",
-    "early_stop_error_threshold": "EARLY_STOP_ERROR_THRESHOLD",
-    "early_stop_velocity_grad_eps": "EARLY_STOP_VELOCITY_GRAD_EPS",
+    "stop_residual_px": "STOP_RESIDUAL_PX",
+    "stop_mse_per_px": "STOP_MSE_PER_PX",
+    "dynamic_ibvs_iters": "DYNAMIC_IBVS_ITERS",
     "rpe_delta": "RPE_DELTA",
     "run_tag": "RUN_TAG",
     "save_task_viz": "SAVE_TASK_VIZ",
@@ -58,8 +59,8 @@ SERVO_FRAMES_CONFIG_KEYS = {
     "min_features": "MIN_FEATURES",
     "ratio": "RATIO",
     "run_name": "RUN_NAME",
-    "early_stop_error_threshold": "EARLY_STOP_ERROR_THRESHOLD",
-    "early_stop_velocity_grad_eps": "EARLY_STOP_VELOCITY_GRAD_EPS",
+    "stop_residual_px": "STOP_RESIDUAL_PX",
+    "stop_mse_per_px": "STOP_MSE_PER_PX",
     **_PHOTOMETRIC_KEYS,
 }
 
@@ -123,13 +124,13 @@ FLOAT_KEYS = {
     "gain_ibvs",
     "gain_photo",
     "nerf_render_scale",
-    "early_stop_error_threshold",
-    "early_stop_velocity_grad_eps",
+    "stop_residual_px",
+    "stop_mse_per_px",
     "sigma_blur",
     "grad_percentile",
 }
 OPTIONAL_FLOAT_KEYS = {"huber_k"}
-BOOL_KEYS = {"save_task_viz", "use_gzn", "use_huber"}
+BOOL_KEYS = {"save_task_viz", "use_gzn", "use_huber", "dynamic_ibvs_iters"}
 OPTIONAL_STR_KEYS = {"run_tag", "run_name"}
 
 

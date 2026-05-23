@@ -33,8 +33,8 @@ GAIN_PHOTO = 0.005
 MIN_FEATURES = 3
 RATIO = 1
 RUN_NAME = None
-EARLY_STOP_ERROR_THRESHOLD = 1e-5
-EARLY_STOP_VELOCITY_GRAD_EPS = 1e-8
+STOP_RESIDUAL_PX = 0.5      # IBVS: RMS reprojection error (px)
+STOP_MSE_PER_PX = 2.0e-6    # photometric: mean(e^2) per pixel on [0, 1] floats
 
 CONTROLLER = "ibvs"  # "ibvs", "photometric", or "photometric_torch"
 SIGMA_BLUR = 1.0
@@ -235,6 +235,9 @@ def write_history_csv(path, history):
         "wx",
         "wy",
         "wz",
+        "render_ms",
+        "controller_ms",
+        "iter_ms",
         "stop_reason",
     ]
 
@@ -265,6 +268,9 @@ def write_history_csv(path, history):
                 "wx": float(velocity[3]),
                 "wy": float(velocity[4]),
                 "wz": float(velocity[5]),
+                "render_ms": item.get("render_ms", ""),
+                "controller_ms": item.get("controller_ms", ""),
+                "iter_ms": item.get("iter_ms", ""),
                 "stop_reason": item.get("stop_reason", ""),
             })
 
@@ -418,8 +424,8 @@ def experiment_config(
         "min_features": int(MIN_FEATURES),
         "ratio": int(RATIO),
         "run_name": RUN_NAME,
-        "early_stop_error_threshold": float(EARLY_STOP_ERROR_THRESHOLD),
-        "early_stop_velocity_grad_eps": float(EARLY_STOP_VELOCITY_GRAD_EPS),
+        "stop_residual_px": float(STOP_RESIDUAL_PX),
+        "stop_mse_per_px": float(STOP_MSE_PER_PX),
         "controller_kind": CONTROLLER,
         "sigma_blur": float(SIGMA_BLUR),
         "use_gzn": bool(USE_GZN),
@@ -431,7 +437,6 @@ def experiment_config(
 
 
 def run(args):
-    import numpy as np
     from controllers import IBVSController, PhotometricController
     from experiment_config import (
         SERVO_FRAMES_CONFIG_KEYS,
@@ -441,7 +446,7 @@ def run(args):
     )
     from features import FeatureMatcher
     from photometric import PhotometricControllerTorch
-    from servo import SimpleStopper, run_servo_loop
+    from servo import run_servo_loop
     from viz import save_error_evolution
 
     applied_config = load_cli_config(
@@ -477,6 +482,7 @@ def run(args):
             scene=scene,
             use_intrinsic_depth=DEPTH_MODE == "intrinsic",
             ratio=RATIO,
+            stop_residual_px=STOP_RESIDUAL_PX,
         )
     elif CONTROLLER == "photometric":
         controller = PhotometricController(
@@ -490,6 +496,7 @@ def run(args):
             use_huber=USE_HUBER,
             huber_k=HUBER_K,
             use_intrinsic_depth=DEPTH_MODE == "intrinsic",
+            stop_mse_per_px=STOP_MSE_PER_PX,
         )
     elif CONTROLLER == "photometric_torch":
         controller = PhotometricControllerTorch(
@@ -504,6 +511,7 @@ def run(args):
             huber_k=HUBER_K,
             use_intrinsic_depth=DEPTH_MODE == "intrinsic",
             method="lm",
+            stop_mse_per_px=STOP_MSE_PER_PX,
         )
     else:
         raise ValueError(f"Unknown CONTROLLER={CONTROLLER!r}")
@@ -558,11 +566,6 @@ def run(args):
             f"inliers={inliers}"
         )
 
-    early_stopper = SimpleStopper(
-        error_threshold=EARLY_STOP_ERROR_THRESHOLD,
-        velocity_grad_eps=EARLY_STOP_VELOCITY_GRAD_EPS,
-    )
-
     result = run_servo_loop(
         scene,
         start_camera,
@@ -574,7 +577,6 @@ def run(args):
         matcher=matcher,
         feature_method=FEATURE_METHOD,
         iteration_callback=record_iteration_metrics,
-        early_stopper=early_stopper,
         viz_iter=VIZ_ITER,
     )
 
@@ -636,6 +638,7 @@ def run(args):
         "iterations_run": len(result["history"]),
         "stop_reason": result["stop_reason"],
         "stop_iteration": result["stop_iteration"],
+        "timing": result.get("timing", {}),
         "history": history_for_json(result["history"]),
     }
 
@@ -663,6 +666,10 @@ def run(args):
         "target_index": int(target_index),
         "iterations_run": len(result["history"]),
         "stop_reason": result["stop_reason"],
+        "fps": float(result.get("timing", {}).get("fps", 0.0)),
+        "render_fps": float(result.get("timing", {}).get("render_fps", 0.0)),
+        "iter_ms_mean": float(result.get("timing", {}).get("iter_ms_mean", 0.0)),
+        "render_ms_mean": float(result.get("timing", {}).get("render_ms_mean", 0.0)),
         "initial_translation_error_m": initial_translation_error,
         "final_translation_error_m": final_translation_error,
         "initial_rotation_error_deg": initial_rotation_error,
@@ -671,12 +678,17 @@ def run(args):
 
     last = result["history"][-1] if result["history"] else {}
     info = last.get("controller_info", {})
+    timing = result.get("timing", {})
     print(
         f"Servo {controller_name} {RENDERER}: index {start_index} -> {target_index} "
         f"({start_frame} -> {target_frame}), "
         f"depth={DEPTH_MODE}, "
         f"iterations={len(result['history'])}/{ITERATIONS}, "
-        f"stop={result['stop_reason']}"
+        f"stop={result['stop_reason']}, "
+        f"fps={timing.get('fps', 0.0):.1f} "
+        f"(iter_ms={timing.get('iter_ms_mean', 0.0):.2f}, "
+        f"render_ms={timing.get('render_ms_mean', 0.0):.2f}, "
+        f"ctrl_ms={timing.get('controller_ms_mean', 0.0):.2f})"
     )
     print(
         f"Translation error: {initial_translation_error * 1000.0:.4f}mm -> "

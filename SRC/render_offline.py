@@ -19,10 +19,6 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
-from PIL import Image
-from scipy.spatial.transform import Rotation
-
 # Make sibling imports work when run as a script.
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
@@ -30,28 +26,8 @@ if str(_HERE) not in sys.path:
 
 from camera import Camera
 from runners.servo_frames import load_rgb, load_scene_and_frames, save_rgb
+from runners.trajectory import read_tum
 from viz import save_side_by_side
-
-
-def read_tum(path):
-    timestamps = []
-    poses = []
-    with open(path) as f:
-        for line in f:
-            parts = line.strip().split()
-            if not parts or parts[0].startswith("#"):
-                continue
-            if len(parts) != 8:
-                raise ValueError(
-                    f"Expected 8 columns in TUM row, got {len(parts)}: {line!r}"
-                )
-            ts, tx, ty, tz, qx, qy, qz, qw = (float(p) for p in parts)
-            T = np.eye(4, dtype=np.float32)
-            T[:3, :3] = Rotation.from_quat([qx, qy, qz, qw]).as_matrix().astype(np.float32)
-            T[:3, 3] = [tx, ty, tz]
-            timestamps.append(ts)
-            poses.append(T)
-    return timestamps, poses
 
 
 def build_camera(intrinsics, T_world_cam):
@@ -128,12 +104,12 @@ def main():
     scene, _frame_index = load_scene_and_frames(scene_dir, renderer)
 
     print(f"Reading sim trajectory: {sim_tum_path}")
-    sim_ts, sim_poses = read_tum(sim_tum_path)
+    _, sim_poses = read_tum(sim_tum_path)
 
-    gt_ts, gt_poses = ([], [])
+    _, gt_poses = ([], [])
     if args.gt and gt_tum_path.exists():
         print(f"Reading gt trajectory:  {gt_tum_path}")
-        gt_ts, gt_poses = read_tum(gt_tum_path)
+        _, gt_poses = read_tum(gt_tum_path)
         if len(gt_poses) != len(sim_poses):
             print(
                 f"warning: gt traj has {len(gt_poses)} poses, "

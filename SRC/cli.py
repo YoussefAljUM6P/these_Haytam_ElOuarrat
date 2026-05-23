@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+from runners import inspect as runner_inspect
 from runners import matrix as runner_matrix
 from runners import servo_frames as runner_servo_frames
 from runners import smoke as runner_smoke
@@ -32,7 +33,6 @@ from runners import trajectory as runner_trajectory
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = PROJECT_ROOT / "DATA"
 CONFIG_ROOT = PROJECT_ROOT / "CONFIGS"
-SRC_ROOT = PROJECT_ROOT / "SRC"
 
 
 SUBCOMMANDS = {
@@ -51,6 +51,10 @@ SUBCOMMANDS = {
     "matrix": {
         "runner": runner_matrix,
         "help": "Servo matrix sweep (scene x depth x matcher).",
+    },
+    "inspect": {
+        "runner": runner_inspect,
+        "help": "Render pose at frame N and compare to real image (optional features).",
     },
 }
 
@@ -93,6 +97,11 @@ TASKS = {
         "kind": "servo_frames",
         "command": "servo-frames",
         "label": "Servo frames — single frame-to-frame servo",
+    },
+    "inspect": {
+        "kind": "inspect",
+        "command": "inspect",
+        "label": "Inspect     — render pose at frame N vs real image",
     },
 }
 
@@ -305,11 +314,11 @@ def wizard():
         cfg["min_features"] = ask_text("Min features:", 3, int)
         cfg["ratio"] = ask_text("Match ratio (0 = match once):", 1, int)
         cfg["viz_iter"] = ask_text("Viz every N iters (0 disables):", 1, int)
-        cfg["early_stop_error_threshold"] = ask_text(
-            "Early stop error threshold:", 1e-5, float
+        cfg["stop_residual_px"] = ask_text(
+            "IBVS stop: RMS reprojection error (px):", 0.5, float
         )
-        cfg["early_stop_velocity_grad_eps"] = ask_text(
-            "Early stop velocity grad eps:", 1e-8, float
+        cfg["stop_mse_per_px"] = ask_text(
+            "Photometric stop: mean(e^2) per pixel on [0,1]:", 2.0e-6, float
         )
         cfg["run_name"] = ask_text(
             "Run name (blank = auto):", None, str, optional=True
@@ -336,11 +345,11 @@ def wizard():
         cfg["rpe_delta"] = ask_text("RPE delta:", 1, int)
 
         console.rule("[bold magenta]Stopping + viz[/]")
-        cfg["early_stop_error_threshold"] = ask_text(
-            "Early stop error threshold:", 1e-5, float
+        cfg["stop_residual_px"] = ask_text(
+            "IBVS stop: RMS reprojection error (px):", 0.5, float
         )
-        cfg["early_stop_velocity_grad_eps"] = ask_text(
-            "Early stop velocity grad eps:", 1e-8, float
+        cfg["stop_mse_per_px"] = ask_text(
+            "Photometric stop: mean(e^2) per pixel on [0,1]:", 2.0e-6, float
         )
         cfg["save_task_viz"] = ask_confirm("Save per-task viz?", default=True)
         cfg["task_viz_every"] = ask_text("Save viz every N tasks:", 1, int)
@@ -348,6 +357,48 @@ def wizard():
             "Run tag (blank = auto):", None, str, optional=True
         )
         return cfg
+
+    def run_inspect_wizard(scene_name, scene_renderers):
+        if len(scene_renderers) == 1:
+            renderer = scene_renderers[0]
+            console.print(f"[grey50]renderer auto-picked:[/] [bold]{renderer}[/]")
+        else:
+            renderer = ask_select(
+                "Renderer:",
+                [Choice(r, value=r) for r in scene_renderers],
+                default=scene_renderers[0],
+            )
+
+        index = ask_text("Frame index (1-based):", 1, int)
+
+        features = ask_select(
+            "Feature overlay:",
+            [
+                Choice("none   — just side-by-side render vs real", value="none"),
+                Choice("sift   — overlay SIFT matches (RANSAC filtered)", value="sift"),
+                Choice("xfeat  — overlay XFeat matches (RANSAC filtered)", value="xfeat"),
+            ],
+            default="none",
+        )
+
+        output = ask_text(
+            "Output PNG path (blank = auto under RUNS/inspect/):",
+            None,
+            str,
+            optional=True,
+        )
+
+        console.rule("[bold green]Launching inspect[/]")
+        runner_args = SimpleNamespace(
+            command="inspect",
+            scene=scene_name,
+            index=int(index),
+            renderer=renderer,
+            features=features,
+            output=output,
+        )
+        runner_inspect.run(runner_args)
+        return 0
 
     banner()
     scenes = list_scenes()
@@ -363,6 +414,27 @@ def wizard():
         [Choice(v["label"], value=k) for k, v in TASKS.items()],
         default="trajectory",
     )
+
+    if task_key == "inspect":
+        scene_name = ask_select(
+            "Scene:",
+            [
+                Choice(
+                    f"{name}   [{', '.join(rs) if rs else 'no renderable assets'}]",
+                    value=name,
+                )
+                for name, rs in scenes
+            ],
+            default=scenes[0][0],
+        )
+        scene_renderers = dict(scenes)[scene_name]
+        if not scene_renderers:
+            console.print(
+                f"[red]Scene {scene_name!r} has no renderable assets "
+                f"(expected mesh.ply, gs.ply, or nerf/).[/]"
+            )
+            return 1
+        return run_inspect_wizard(scene_name, scene_renderers)
 
     controller = ask_select(
         "Controller:",

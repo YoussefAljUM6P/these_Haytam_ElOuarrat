@@ -36,7 +36,6 @@ class NeRFScene:
         # Lazy-load nerfstudio.
         from nerfstudio.utils.eval_utils import eval_setup
 
-        print(f"[NeRFScene] Loading model from {config_path}")
         self._config_path = config_path
         _, self.pipeline, _, _ = eval_setup(
             config_path,
@@ -47,7 +46,6 @@ class NeRFScene:
         self._last_camera = None
         self._last_render_key = None
         self._last_depth = None
-        self._render_count = 0
 
     def _patch_config_paths(self, config):
         """Rewrite saved relative paths so inference works regardless of CWD.
@@ -153,10 +151,6 @@ class NeRFScene:
     def render(self, camera):
         self._last_camera = camera
         key = self._camera_key(camera)
-
-        if self._render_count == 0:
-            print(f"[NeRFScene] First render at {camera.W}x{camera.H}")
-        self._render_count += 1
 
         ns_cam = self._make_ns_camera(camera)
         

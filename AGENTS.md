@@ -10,7 +10,8 @@ ViSERVO: virtual visual servoing for 6-DOF camera pose estimation. Given a targe
 - Working hypothesis: photometric + 3DGS wins (appearance fidelity closes the domain gap).
 
 ## Layout
-- `SRC/` — project code. Entrypoints: `main.py` (smoke test), `main_servo_frames.py`, `main_trajectory.py`.
+- `SRC/` — project code. Single entry point: `cli.py`.
+- `SRC/runners/` — runnable experiments (`smoke`, `servo_frames`, `trajectory`, `matrix`). Not executed directly; dispatched by `cli.py`.
 - `SRC/scenes/` — renderers (`mesh.py`, `gs.py`, `nerf.py`).
 - `SRC/depth.py` — single entry point for depth (see policy below).
 - `SRC/third_party/` — vendored upstream. Don't edit; wrap.
@@ -21,8 +22,11 @@ ViSERVO: virtual visual servoing for 6-DOF camera pose estimation. Given a targe
 ## Run
 ```bash
 cd SRC
-python main.py            # smoke test → output_mesh.png, output_gs.png
-python main_trajectory.py --config ../CONFIGS/trajectory_kitchen_mesh.json
+python cli.py                                              # interactive wizard
+python cli.py smoke                                        # mesh + GS smoke test
+python cli.py servo-frames --config ../CONFIGS/servo_kitchen_mesh.json
+python cli.py trajectory   --config ../CONFIGS/trajectory_kitchen_mesh.json
+python cli.py matrix       --dataset kitchen --iterations 30
 ```
 
 ## Conventions

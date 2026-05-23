@@ -9,7 +9,6 @@ import numpy as np
 import torch
 
 from camera import Camera
-from controllers import PhotometricController
 from photometric import (
     FeatureLuminance,
     PhotometricControllerTorch,
@@ -411,7 +410,7 @@ def _try_render_vs_real():
             scene, start_camera, target_image, ctrl,
             iterations=REAL_TEST_ITERATIONS, dt=1.0,
             visualization_dir=None, matcher=None,
-            iteration_callback=None, early_stopper=None,
+            iteration_callback=None,
             viz_iter=0,
         )
     except Exception as exc:
