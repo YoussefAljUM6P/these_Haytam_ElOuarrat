@@ -87,7 +87,12 @@ class FeatureLuminance:
         self._rng = torch.Generator(device="cpu")
         self._rng.manual_seed(int(seed))
 
+        I_star_raw = rgb_to_gray(target_image).to(self.device)
         I_star = _preprocess(target_image, self.sigma_blur, self.use_gzn).to(self.device)
+        if I_star_raw.shape != I_star.shape:
+            raise ValueError(
+                f"raw target shape {tuple(I_star_raw.shape)} != image shape {tuple(I_star.shape)}"
+            )
         gx_star = derivative_filter_x(I_star)
         gy_star = derivative_filter_y(I_star)
         Z_star = torch.as_tensor(depth_star, dtype=torch.float32, device=self.device)
@@ -127,11 +132,13 @@ class FeatureLuminance:
         flat = lambda a: a.reshape(-1)
         self._idx = idx
         self._I_star = flat(I_star)[idx].contiguous()
+        self._I_star_raw = flat(I_star_raw)[idx].contiguous()
         self._Z_star = flat(Z_star)[idx].contiguous()
         self._xn = flat(xn_full)[idx].contiguous()
         self._yn = flat(yn_full)[idx].contiguous()
 
         self._I_cur = None
+        self._I_cur_raw = None
         self._gx_cur = None
         self._gy_cur = None
         self._shape = (H, W)
@@ -157,12 +164,18 @@ class FeatureLuminance:
         return self._Z_star
 
     def build_from(self, image: Union[torch.Tensor, NDArray[np.float32]]) -> torch.Tensor:
+        I_cur_raw = rgb_to_gray(image).to(self.device)
         I_cur = _preprocess(image, self.sigma_blur, self.use_gzn).to(self.device)
         if I_cur.shape != self._shape:
             raise ValueError(
                 f"image shape {tuple(I_cur.shape)} != expected {self._shape}"
             )
+        if I_cur_raw.shape != self._shape:
+            raise ValueError(
+                f"raw image shape {tuple(I_cur_raw.shape)} != expected {self._shape}"
+            )
         self._I_cur = I_cur.reshape(-1)[self._idx]
+        self._I_cur_raw = I_cur_raw.reshape(-1)[self._idx]
         self._gx_cur = derivative_filter_x(I_cur).reshape(-1)[self._idx]
         self._gy_cur = derivative_filter_y(I_cur).reshape(-1)[self._idx]
         return self._I_cur
@@ -171,6 +184,11 @@ class FeatureLuminance:
         if self._I_cur is None:
             raise RuntimeError("FeatureLuminance.error() called before build_from()")
         return self._I_cur - self._I_star
+
+    def raw_error(self) -> torch.Tensor:
+        if self._I_cur_raw is None:
+            raise RuntimeError("FeatureLuminance.raw_error() called before build_from()")
+        return self._I_cur_raw - self._I_star_raw
 
     def interaction(self) -> torch.Tensor:
         """L_I built from current Ix, Iy and cached x*, y*, Z* (desired-side depth)."""

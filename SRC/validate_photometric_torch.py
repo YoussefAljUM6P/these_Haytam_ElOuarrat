@@ -257,18 +257,35 @@ def test_torch_controller_zero_error_returns_zero_velocity():
         raise AssertionError("backend must be 'torch'")
 
 
-def test_torch_controller_translation_residual_drives_velocity():
+def test_torch_controller_rank_deficient_returns_fault():
     cam = make_camera()
     H, W = cam.H, cam.W
-    base = np.linspace(0.1, 0.9, W, dtype=np.float32)
-    target = np.zeros((H, W, 3), dtype=np.float32)
-    for c in range(3):
-        target[:, :, c] = base[None, :]
+    target = np.full((H, W, 3), 0.5, dtype=np.float32)
+    rendered = np.full_like(target, 0.55)
+    ctrl = _make_torch_controller(cam, cam, gain=1.0)
+    v = ctrl(rendered, target, cam, iteration=0)
+    if not np.allclose(v, 0.0, atol=1e-8):
+        raise AssertionError(f"rank-deficient target should return zero velocity, got {v}")
+    if ctrl.last_info["fault_reason"] != "measurement_invalid_rank_deficient":
+        raise AssertionError(f"wrong fault: {ctrl.last_info}")
+    if ctrl.should_stop() != "measurement_invalid_rank_deficient":
+        raise AssertionError(f"wrong stop reason: {ctrl.should_stop()}")
+
+
+def test_torch_controller_textured_residual_drives_velocity():
+    cam = make_camera()
+    H, W = cam.H, cam.W
+    rng = np.random.default_rng(3)
+    target = rng.uniform(0.1, 0.9, (H, W, 3)).astype(np.float32)
     rendered = np.zeros_like(target)
     rendered[:, 1:, :] = target[:, :-1, :]
     rendered[:, 0, :] = target[:, 0, :]
     ctrl = _make_torch_controller(cam, cam, gain=1.0)
     v = ctrl(rendered, target, cam, iteration=0)
+    if ctrl.last_info["fault_reason"] is not None:
+        raise AssertionError(f"unexpected fault: {ctrl.last_info}")
+    if ctrl.last_info["interaction_rank"] < 6:
+        raise AssertionError(f"expected full rank, got {ctrl.last_info}")
     if not np.isfinite(v).all():
         raise AssertionError(f"v must be finite, got {v}")
     if float(np.linalg.norm(v)) <= 0.0:
@@ -303,11 +320,118 @@ def test_torch_controller_last_info_has_parity_keys():
     required = {
         "iteration", "feature_mode", "num_raw_matches", "num_inlier_matches",
         "num_cached_features", "num_dropped_features", "residual_norm",
-        "velocity_norm", "mean_depth_m", "min_depth_m", "max_depth_m",
+        "velocity_norm", "mean_depth", "min_depth", "max_depth",
     }
     missing = required - set(ctrl.last_info)
     if missing:
         raise AssertionError(f"last_info missing keys: {missing}")
+
+
+
+# ---- integration: servo-loop motion ----------------------------------------
+
+
+def _translation_gap(camera, target_camera):
+    return float(np.linalg.norm(
+        camera.T_world_cam[:3, 3] - target_camera.T_world_cam[:3, 3]
+    ))
+
+
+def _motion_summary(result, start_camera, target_camera):
+    final_camera = result["camera"]
+    return {
+        "initial_gap": _translation_gap(start_camera, target_camera),
+        "final_gap": _translation_gap(final_camera, target_camera),
+        "pose_delta": float(np.linalg.norm(
+            final_camera.T_world_cam[:3, 3] - start_camera.T_world_cam[:3, 3]
+        )),
+        "accepted_steps": int(sum(
+            1 for item in result.get("history", [])
+            if item.get("step_accepted")
+        )),
+        "iterations_run": int(len(result.get("history", []))),
+        "stop_reason": result.get("stop_reason"),
+    }
+
+
+def _assert_servo_moved(summary, label):
+    if int(summary["accepted_steps"]) <= 0:
+        raise AssertionError(f"{label} accepted no servo steps: {summary}")
+    if not np.isfinite(summary["pose_delta"]):
+        raise AssertionError(f"{label} pose delta is non-finite: {summary}")
+    if float(summary["pose_delta"]) <= 1e-9:
+        raise AssertionError(f"{label} final pose did not change: {summary}")
+
+
+def _try_torch_sim_to_sim_motion():
+    try:
+        from validate_photometric import _build_textured_plane_scene, _camera_at
+        scene, _ = _build_textured_plane_scene()
+    except Exception as exc:
+        return None, f"renderer unavailable: {exc}"
+
+    target_camera = _camera_at(translation_xyz=(0.0, 0.0, 0.0),
+                               rotation_axis_angle_deg=None)
+    start_camera = _camera_at(translation_xyz=(0.02, 0.0, 0.0),
+                              rotation_axis_angle_deg=None)
+    try:
+        target_image = scene.render(target_camera)
+    except Exception as exc:
+        return None, f"target render failed: {exc}"
+
+    from servo import run_servo_loop
+
+    ctrl = PhotometricControllerTorch(
+        scene=scene,
+        target_camera=target_camera,
+        gain=0.01,
+        sigma_blur=1.0,
+        use_gzn=True,
+        bord=10,
+        grad_percentile=50.0,
+        max_pixels=20_000,
+        use_huber=True,
+        use_intrinsic_depth=True,
+        method="lm",
+        mu_init=0.1,
+    )
+
+    result = run_servo_loop(
+        scene, start_camera, target_image, ctrl,
+        iterations=80, dt=1.0,
+        visualization_dir=None, matcher=None,
+        iteration_callback=None,
+        viz_iter=0,
+    )
+    return _motion_summary(result, start_camera, target_camera), None
+
+
+def test_torch_sim_to_sim_moves_and_closes_gap():
+    summary, skip = _try_torch_sim_to_sim_motion()
+    if skip is not None:
+        print(f"  (skipping torch sim-to-sim motion: {skip})")
+        return
+    _assert_servo_moved(summary, "torch sim-to-sim")
+    if summary["final_gap"] >= summary["initial_gap"]:
+        raise AssertionError(
+            f"torch sim-to-sim failed to reduce translation gap: {summary}"
+        )
+    if summary["final_gap"] >= 0.5 * summary["initial_gap"]:
+        raise AssertionError(
+            f"torch sim-to-sim did not close enough gap: {summary}"
+        )
+    print(
+        "  torch sim-to-sim: "
+        f"t_gap={summary['initial_gap']:.6f} -> {summary['final_gap']:.6f} "
+        f"pose_delta={summary['pose_delta']:.6f} "
+        f"accepted={summary['accepted_steps']}"
+    )
+
+
+def _valid_depth_pixels(scene, camera, min_depth=1e-4):
+    depth = np.asarray(scene.render_depth(camera), dtype=np.float32)
+    valid = np.isfinite(depth) & (depth > float(min_depth))
+    return int(valid.sum())
 
 
 # ---- integration: render-vs-real on a COLMAP dataset -----------------------
@@ -326,10 +450,7 @@ REAL_TEST_ITERATIONS = 50
 
 
 def _try_render_vs_real():
-    """Drive servo from real RGB at frame `target`, starting at frame `start`.
-
-    Returns (initial_err_m, final_err_m, scene_label, renderer_label, skip_reason).
-    """
+    """Drive servo from real RGB at frame `target`, starting at frame `start`."""
     from pathlib import Path
 
     project_root = Path(__file__).resolve().parent.parent
@@ -341,13 +462,10 @@ def _try_render_vs_real():
             sorted_frame_ids,
         )
     except Exception as exc:
-        return None, None, None, None, f"runner import failed: {exc}"
+        return None, f"runner import failed: {exc}"
 
-    scene = None
-    frame_index = None
-    scene_used = None
-    renderer_used = None
     load_errors = []
+    selected = None
     for scene_name in REAL_TEST_SCENES:
         scene_dir = project_root / "DATA" / scene_name
         if not scene_dir.exists():
@@ -356,33 +474,49 @@ def _try_render_vs_real():
         for renderer in REAL_TEST_RENDERERS:
             try:
                 scene, frame_index = load_scene_and_frames(scene_dir, renderer)
-                scene_used = scene_name
-                renderer_used = renderer
+                frame_ids = sorted_frame_ids(frame_index)
+                if len(frame_ids) < REAL_TEST_FRAME_STRIDE + 1:
+                    load_errors.append(
+                        f"{scene_name}/{renderer}: not enough frames "
+                        f"{len(frame_ids)} < {REAL_TEST_FRAME_STRIDE + 1}"
+                    )
+                    continue
+                start_frame_id = frame_ids[0]
+                target_frame_id = frame_ids[REAL_TEST_FRAME_STRIDE]
+                start_camera = frame_index[start_frame_id]["camera"]
+                target_camera = frame_index[target_frame_id]["camera"]
+                target_rgb_path = frame_index[target_frame_id]["rgb_path"]
+                if not target_rgb_path.exists():
+                    load_errors.append(
+                        f"{scene_name}/{renderer}: target RGB missing "
+                        f"{target_rgb_path}"
+                    )
+                    continue
+                valid_depth_pixels = _valid_depth_pixels(scene, target_camera)
+                if valid_depth_pixels < 6:
+                    load_errors.append(
+                        f"{scene_name}/{renderer}: target intrinsic depth has "
+                        f"{valid_depth_pixels} valid pixels"
+                    )
+                    continue
+                selected = (
+                    scene_name, renderer, scene, start_camera, target_camera,
+                    target_rgb_path, start_frame_id, target_frame_id,
+                    valid_depth_pixels,
+                )
                 break
             except Exception as exc:
                 load_errors.append(f"{scene_name}/{renderer}: {exc}")
-        if scene is not None:
+        if selected is not None:
             break
-    if scene is None:
-        return None, None, None, None, f"no scene/renderer loaded ({'; '.join(load_errors)})"
 
-    frame_ids = sorted_frame_ids(frame_index)
-    if len(frame_ids) < REAL_TEST_FRAME_STRIDE + 1:
-        return None, None, scene_used, renderer_used, (
-            f"not enough frames: {len(frame_ids)} < {REAL_TEST_FRAME_STRIDE + 1}"
-        )
-    start_frame_id = frame_ids[0]
-    target_frame_id = frame_ids[REAL_TEST_FRAME_STRIDE]
+    if selected is None:
+        return None, f"no usable render-vs-real fixture ({'; '.join(load_errors)})"
 
-    start_camera = frame_index[start_frame_id]["camera"]
-    target_camera = frame_index[target_frame_id]["camera"]
-    target_rgb_path = frame_index[target_frame_id]["rgb_path"]
-
-    if not target_rgb_path.exists():
-        return None, None, scene_used, renderer_used, (
-            f"target RGB missing: {target_rgb_path}"
-        )
-
+    (
+        scene_name, renderer, scene, start_camera, target_camera,
+        target_rgb_path, start_frame_id, target_frame_id, valid_depth_pixels,
+    ) = selected
     target_image = load_rgb(target_rgb_path, start_camera.W, start_camera.H)
 
     from servo import run_servo_loop
@@ -402,9 +536,6 @@ def _try_render_vs_real():
         mu_init=0.1,
     )
 
-    initial_err = float(np.linalg.norm(
-        start_camera.T_world_cam[:3, 3] - target_camera.T_world_cam[:3, 3]
-    ))
     try:
         result = run_servo_loop(
             scene, start_camera, target_image, ctrl,
@@ -414,35 +545,44 @@ def _try_render_vs_real():
             viz_iter=0,
         )
     except Exception as exc:
-        return initial_err, None, scene_used, renderer_used, f"servo loop failed: {exc}"
+        return None, f"servo loop failed: {exc}"
 
-    final_camera = result["camera"]
-    final_err = float(np.linalg.norm(
-        final_camera.T_world_cam[:3, 3] - target_camera.T_world_cam[:3, 3]
-    ))
-    return initial_err, final_err, scene_used, renderer_used, None
+    summary = _motion_summary(result, start_camera, target_camera)
+    summary.update({
+        "scene": scene_name,
+        "renderer": renderer,
+        "start_frame": start_frame_id,
+        "target_frame": target_frame_id,
+        "valid_depth_pixels": int(valid_depth_pixels),
+    })
+    return summary, None
 
 
 def test_render_vs_real_translation():
-    """Smoke test on real captured RGB. Does NOT assert convergence — the
-    research question is whether photometric VS can close the render/real
-    domain gap, and this test exists to keep that pipeline runnable. Failures
-    here mean the pipeline itself is broken, not that the algorithm is wrong.
+    """Smoke test on real captured RGB. Does NOT assert convergence.
+
+    It does assert that a usable real fixture produces at least one accepted
+    servo step and a nonzero pose update. If the local fixture has no valid
+    intrinsic target depth, the test skips instead of reporting a fake stable
+    gap.
     """
-    initial, final, scene_name, renderer, skip = _try_render_vs_real()
+    summary, skip = _try_render_vs_real()
     if skip is not None:
         print(f"  (skipping render-vs-real: {skip})")
         return
-    if not np.isfinite(initial):
-        raise AssertionError(f"initial error non-finite: {initial}")
-    if final is None or not np.isfinite(final):
-        raise AssertionError(f"final error non-finite: {final}")
-    delta_mm = (final - initial) * 1000.0
+    if not np.isfinite(summary["initial_gap"]):
+        raise AssertionError(f"initial gap non-finite: {summary}")
+    if not np.isfinite(summary["final_gap"]):
+        raise AssertionError(f"final gap non-finite: {summary}")
+    _assert_servo_moved(summary, "render-vs-real")
+    delta_gap = summary["final_gap"] - summary["initial_gap"]
     print(
-        f"  render-vs-real ({scene_name} / {renderer}, "
-        f"stride {REAL_TEST_FRAME_STRIDE}): "
-        f"{initial * 1000:.2f}mm -> {final * 1000:.2f}mm "
-        f"(Δ {delta_mm:+.2f}mm)"
+        f"  render-vs-real ({summary['scene']} / {summary['renderer']}, "
+        f"{summary['start_frame']} -> {summary['target_frame']}): "
+        f"t_gap={summary['initial_gap']:.6f} -> {summary['final_gap']:.6f} "
+        f"delta={delta_gap:+.6f} "
+        f"pose_delta={summary['pose_delta']:.6f} "
+        f"accepted={summary['accepted_steps']}"
     )
 
 
@@ -462,9 +602,11 @@ def main():
     test_feature_luminance_drops_border_pixels()
     test_feature_luminance_residual_zero_for_identical_images()
     test_torch_controller_zero_error_returns_zero_velocity()
-    test_torch_controller_translation_residual_drives_velocity()
+    test_torch_controller_rank_deficient_returns_fault()
+    test_torch_controller_textured_residual_drives_velocity()
     test_torch_controller_missing_target_camera_raises()
     test_torch_controller_last_info_has_parity_keys()
+    test_torch_sim_to_sim_moves_and_closes_gap()
     test_render_vs_real_translation()
     print("Torch photometric controller validation passed")
 

@@ -26,7 +26,7 @@ def add_arguments(parser):
 def run(args):
     import numpy as np
     from PIL import Image
-    from dataset import load_colmap, load_scannet
+    from dataset import load_colmap
     from features import FeatureMatcher, filter_matches
     from scenes.gs import GSScene
     from scenes.mesh import MeshScene
@@ -76,11 +76,12 @@ def run(args):
     matcher = FeatureMatcher(method=FEATURE_METHOD)
     print(f"Using {FEATURE_METHOD} feature matcher")
 
+    colmap_data = load_colmap(scene_dir)
+    if not colmap_data:
+        raise RuntimeError(f"No COLMAP images in {scene_dir}")
+
     print("Running Mesh test...")
-    scannet_data = load_scannet(scene_dir)
-    if not scannet_data:
-        raise RuntimeError(f"No valid ScanNet frames in {scene_dir}")
-    camera, rgb_path, depth_path = random.choice(scannet_data)
+    camera, rgb_path = random.choice(colmap_data)
 
     mesh_scene = MeshScene(scene_dir / "mesh.ply")
     rendered_mesh = mesh_scene.render(camera)
@@ -103,9 +104,6 @@ def run(args):
     )
 
     print("Running GS test...")
-    colmap_data = load_colmap(scene_dir)
-    if not colmap_data:
-        raise RuntimeError(f"No COLMAP images in {scene_dir}")
     camera_gs, rgb_path_gs = random.choice(colmap_data)
 
     gs_scene = GSScene(scene_dir / "gs.ply")

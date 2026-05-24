@@ -10,6 +10,83 @@ def save_side_by_side(img1, img2, path):
     Image.fromarray(out_uint8).save(path)
 
 
+def _to_uint8_rgb(image):
+    arr = np.asarray(image, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = np.stack([arr] * 3, axis=-1)
+    arr = np.clip(arr, 0.0, 1.0)
+    return (arr * 255.0 + 0.5).astype(np.uint8)
+
+
+def _to_gray01(image):
+    arr = np.asarray(image, dtype=np.float32)
+    if arr.ndim == 2:
+        return np.clip(arr, 0.0, 1.0)
+    return cv2.cvtColor(np.clip(arr, 0.0, 1.0), cv2.COLOR_RGB2GRAY)
+
+
+def _panel_with_label(image, label):
+    image = np.asarray(image, dtype=np.uint8)
+    height, width = image.shape[:2]
+    label_strip = 22
+    panel = np.zeros((height + label_strip, width, 3), dtype=np.uint8)
+    cv2.putText(
+        panel,
+        label,
+        (4, 16),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    panel[label_strip:, :, :] = image
+    return panel
+
+
+def save_current_desired_error_visualization(
+    current,
+    desired,
+    path,
+    *,
+    current_label="current",
+    desired_label="desired",
+):
+    current_rgb = _to_uint8_rgb(current)
+    desired_rgb = _to_uint8_rgb(desired)
+    if current_rgb.shape != desired_rgb.shape:
+        raise ValueError(
+            f"current and desired images must have same shape, got "
+            f"{current_rgb.shape} vs {desired_rgb.shape}"
+        )
+
+    gray_current = _to_gray01(current)
+    gray_desired = _to_gray01(desired)
+    diff = np.abs(gray_current - gray_desired)
+    diff_max = float(diff.max()) if diff.size else 0.0
+    diff_mean = float(diff.mean()) if diff.size else 0.0
+    diff_fixed = (np.clip(diff, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    heat_bgr = cv2.applyColorMap(diff_fixed, cv2.COLORMAP_JET)
+    heat_rgb = cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)
+
+    panels = [
+        _panel_with_label(current_rgb, current_label),
+        _panel_with_label(desired_rgb, desired_label),
+        _panel_with_label(heat_rgb, f"photo error max={diff_max:.3f}"),
+    ]
+    canvas = np.concatenate(panels, axis=1)
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
+
+    return {
+        "visualization_path": str(path),
+        "diff_max": diff_max,
+        "diff_mean": diff_mean,
+    }
+
+
 def _to_int_pixels(kpts, x_offset=0):
     if len(kpts) == 0:
         return np.zeros((0, 2), dtype=np.int32)
@@ -83,12 +160,8 @@ def save_error_evolution(history, path):
             (30, 110, 230),
         ),
         (
-            "pose distance (mm)",
-            lambda item: (
-                item.get("translation_error_m") * 1000.0
-                if item.get("translation_error_m") is not None
-                else None
-            ),
+            "translation gap",
+            lambda item: item.get("translation_gap"),
             (35, 150, 85),
         ),
         (

@@ -252,6 +252,110 @@ def huber_weights(residuals: NDArray[np.float32], k: Optional[float] = None) -> 
     return w.astype(np.float32, copy=False), k
 
 
+DEFAULT_MIN_INTERACTION_RANK = 6
+DEFAULT_MAX_INTERACTION_CONDITION = 1.0e8
+INTERACTION_RANK_REL_TOL = 1.0e-12
+INTERACTION_RANK_ABS_TOL = 1.0e-12
+
+
+def validate_interaction_guard(
+    min_rank: int = DEFAULT_MIN_INTERACTION_RANK,
+    max_condition: Optional[float] = DEFAULT_MAX_INTERACTION_CONDITION,
+) -> Tuple[int, Optional[float]]:
+    min_rank = int(min_rank)
+    if min_rank < 1 or min_rank > 6:
+        raise ValueError("min_interaction_rank must be in [1, 6]")
+    if max_condition is None:
+        return min_rank, None
+    max_condition = float(max_condition)
+    if not np.isfinite(max_condition) or max_condition <= 0.0:
+        raise ValueError("max_interaction_condition must be positive or None")
+    return min_rank, max_condition
+
+
+def interaction_matrix_diagnostics(
+    L: NDArray[np.float32],
+    min_rank: int = DEFAULT_MIN_INTERACTION_RANK,
+    max_condition: Optional[float] = DEFAULT_MAX_INTERACTION_CONDITION,
+) -> Dict[str, Any]:
+    """Return rank/conditioning diagnostics for an effective interaction matrix."""
+    min_rank, max_condition = validate_interaction_guard(min_rank, max_condition)
+    arr = np.asarray(L, dtype=np.float64)
+    rows = int(arr.shape[0]) if arr.ndim >= 1 else 0
+    cols = int(arr.shape[1]) if arr.ndim == 2 else 0
+    info = {
+        "interaction_rows": rows,
+        "interaction_cols": cols,
+        "interaction_rank": 0,
+        "interaction_min_rank": int(min_rank),
+        "interaction_condition": float("inf"),
+        "interaction_max_condition": max_condition,
+        "interaction_min_singular": 0.0,
+        "interaction_max_singular": 0.0,
+        "interaction_rank_tolerance": float("nan"),
+        "interaction_svd_failed": False,
+    }
+
+    if arr.ndim != 2 or rows == 0 or cols == 0 or not np.isfinite(arr).all():
+        return info
+
+    try:
+        singular_values = np.linalg.svd(arr, compute_uv=False)
+    except np.linalg.LinAlgError:
+        info["interaction_svd_failed"] = True
+        return info
+
+    if singular_values.size == 0:
+        return info
+
+    max_singular = float(singular_values[0])
+    rank_tolerance = max(
+        INTERACTION_RANK_ABS_TOL,
+        INTERACTION_RANK_REL_TOL * max_singular,
+    )
+    rank = int(np.count_nonzero(singular_values > rank_tolerance))
+    required_index = int(min_rank) - 1
+    min_required_singular = (
+        float(singular_values[required_index])
+        if required_index < singular_values.size
+        else 0.0
+    )
+    condition = (
+        max_singular / min_required_singular
+        if min_required_singular > 0.0
+        else float("inf")
+    )
+
+    info.update({
+        "interaction_rank": rank,
+        "interaction_condition": float(condition),
+        "interaction_min_singular": float(min_required_singular),
+        "interaction_max_singular": float(max_singular),
+        "interaction_rank_tolerance": float(rank_tolerance),
+    })
+    return info
+
+
+def interaction_fault_reason(info: Dict[str, Any]) -> Optional[str]:
+    if bool(info.get("interaction_svd_failed", False)):
+        return "measurement_invalid_svd_failed"
+    rank = int(info.get("interaction_rank", 0))
+    min_rank = int(info.get("interaction_min_rank", DEFAULT_MIN_INTERACTION_RANK))
+    if rank < min_rank:
+        return "measurement_invalid_rank_deficient"
+    max_condition = info.get("interaction_max_condition")
+    condition = float(info.get("interaction_condition", float("inf")))
+    if (
+        max_condition is not None
+        and np.isfinite(condition)
+        and condition > float(max_condition)
+    ):
+        return "measurement_invalid_ill_conditioned"
+    if max_condition is not None and not np.isfinite(condition):
+        return "measurement_invalid_ill_conditioned"
+    return None
+
+
 class IBVSController:
     """Paper IBVS with optional feature-cache refresh ratio.
 
@@ -276,6 +380,8 @@ class IBVSController:
         adaptive_gain: bool = True,
         velocity_alpha: float = 0.8,
         stop_residual_px: float = 0.5,
+        min_interaction_rank: int = DEFAULT_MIN_INTERACTION_RANK,
+        max_interaction_condition: Optional[float] = DEFAULT_MAX_INTERACTION_CONDITION,
     ) -> None:
         if int(ratio) < 0:
             raise ValueError("ratio must be >= 0")
@@ -293,6 +399,13 @@ class IBVSController:
         # Stop when per-feature mean pixel error (RMS over 2N components) drops
         # below this threshold. Default 0.5 px ~ subpixel agreement.
         self.stop_residual_px = float(stop_residual_px)
+        (
+            self.min_interaction_rank,
+            self.max_interaction_condition,
+        ) = validate_interaction_guard(
+            min_interaction_rank,
+            max_interaction_condition,
+        )
 
         self.cached_points_world = None
         self.cached_target_kpts = None
@@ -337,10 +450,18 @@ class IBVSController:
         depths = depths[valid]
 
         if len(kpts_current) < self.min_features:
-            raise RuntimeError(
-                f"IBVS needs at least {self.min_features} matches with valid "
-                f"depth, got {len(kpts_current)}"
-            )
+            self.cached_points_world = None
+            self.cached_target_kpts = None
+            self.cache_refresh_iteration = int(iteration)
+            return {
+                "mode": "refresh",
+                "num_raw_matches": int(num_raw),
+                "kpts_current": kpts_current,
+                "kpts_target": kpts_target,
+                "depths": depths,
+                "num_dropped_features": int(max(num_raw - len(kpts_current), 0)),
+                "fault_reason": "measurement_invalid_not_enough_features",
+            }
 
         points_cam = backproject_pixels(kpts_current, depths, camera)
         self.cached_points_world = camera_points_to_world(points_cam, camera)
@@ -353,7 +474,8 @@ class IBVSController:
             "kpts_current": kpts_current,
             "kpts_target": kpts_target,
             "depths": depths,
-            "num_dropped_features": 0,
+            "num_dropped_features": int(max(num_raw - len(kpts_current), 0)),
+            "fault_reason": None,
         }
 
     def _reproject(self, rendered: NDArray[np.float32], camera: Camera) -> Dict[str, Any]:
@@ -384,10 +506,15 @@ class IBVSController:
             depths = measured[valid_z]
 
         if len(kpts_current) < self.min_features:
-            raise RuntimeError(
-                f"IBVS needs at least {self.min_features} reprojected features, "
-                f"got {len(kpts_current)}"
-            )
+            return {
+                "mode": "reproject",
+                "num_raw_matches": int(cached_before),
+                "kpts_current": kpts_current,
+                "kpts_target": kpts_target,
+                "depths": depths,
+                "num_dropped_features": int(cached_before - len(kpts_current)),
+                "fault_reason": "measurement_invalid_not_enough_features",
+            }
 
         return {
             "mode": "reproject",
@@ -396,6 +523,7 @@ class IBVSController:
             "kpts_target": kpts_target,
             "depths": depths,
             "num_dropped_features": int(cached_before - len(kpts_current)),
+            "fault_reason": None,
         }
 
     def __call__(self, rendered: NDArray[np.float32], target: NDArray[np.float32], camera: Camera, iteration: int) -> NDArray[np.float32]:
@@ -408,19 +536,64 @@ class IBVSController:
         kpts_target = state["kpts_target"]
         depths = state["depths"]
 
-        # Normalize image coordinates (paper eq. 6).
-        x = normalize_points(kpts_current, camera)
-        x_star = normalize_points(kpts_target, camera)
-        error = (x - x_star).reshape(-1)
+        fault_reason = state.get("fault_reason")
+        if len(kpts_current) > 0:
+            # Normalize image coordinates (paper eq. 6).
+            x = normalize_points(kpts_current, camera)
+            x_star = normalize_points(kpts_target, camera)
+            error = (x - x_star).reshape(-1)
+            pixel_error = (kpts_current - kpts_target).reshape(-1)
+        else:
+            x = np.zeros((0, 2), dtype=np.float32)
+            error = np.zeros((0,), dtype=np.float32)
+            pixel_error = np.zeros((0,), dtype=np.float32)
 
-        # Build L_e from current points + current depths (paper eq. 11).
-        L = point_interaction_matrix(x, depths)
+        interaction_info = interaction_matrix_diagnostics(
+            np.zeros((0, 6), dtype=np.float32),
+            self.min_interaction_rank,
+            self.max_interaction_condition,
+        )
+        if fault_reason is None:
+            # Build L_e from current points + current depths (paper eq. 11).
+            L = point_interaction_matrix(x, depths)
+            if not np.isfinite(error).all() or not np.isfinite(L).all():
+                fault_reason = "measurement_invalid_nonfinite"
+                velocity = np.zeros(6, dtype=np.float32)
+            else:
+                interaction_info = interaction_matrix_diagnostics(
+                    L,
+                    self.min_interaction_rank,
+                    self.max_interaction_condition,
+                )
+                interaction_fault = interaction_fault_reason(interaction_info)
+                if interaction_fault is not None:
+                    fault_reason = interaction_fault
+                    velocity = np.zeros(6, dtype=np.float32)
+                else:
+                    # Control law: v_c = -lambda * pinv(L_e) * e (paper eq. 5).
+                    velocity = (-self.gain * (np.linalg.pinv(L) @ error)).astype(np.float32)
+        else:
+            velocity = np.zeros(6, dtype=np.float32)
 
-        # Control law: v_c = -lambda * pinv(L_e) * e (paper eq. 5).
-        velocity = (-self.gain * (np.linalg.pinv(L) @ error)).astype(np.float32)
+        n_components = int(error.size)
+        residual_norm = float(np.linalg.norm(error)) if n_components else float("nan")
+        pixel_residual_norm = (
+            float(np.linalg.norm(pixel_error)) if pixel_error.size else float("nan")
+        )
+        residual_rms_px = (
+            pixel_residual_norm / float(np.sqrt(int(pixel_error.size)))
+            if pixel_error.size else float("nan")
+        )
+        cached_features = (
+            0 if self.cached_points_world is None else int(len(self.cached_points_world))
+        )
+        if depths.size:
+            mean_d = float(np.mean(depths))
+            min_d = float(np.min(depths))
+            max_d = float(np.max(depths))
+        else:
+            mean_d = min_d = max_d = float("nan")
 
-        n_components = max(int(error.size), 1)
-        residual_norm = float(np.linalg.norm(error))
         self.last_info = {
             "iteration": int(iteration),
             "feature_mode": state["mode"],
@@ -428,14 +601,18 @@ class IBVSController:
             "cache_refresh_iteration": self.cache_refresh_iteration,
             "num_raw_matches": state["num_raw_matches"],
             "num_inlier_matches": int(len(kpts_current)),
-            "num_cached_features": int(len(self.cached_points_world)),
+            "num_cached_features": cached_features,
             "num_dropped_features": state["num_dropped_features"],
+            "measurement_valid": fault_reason is None,
+            "fault_reason": fault_reason,
             "residual_norm": residual_norm,
-            "residual_rms_px": residual_norm / float(np.sqrt(n_components)),
+            "residual_norm_px": pixel_residual_norm,
+            "residual_rms_px": residual_rms_px,
+            **interaction_info,
             "velocity_norm": float(np.linalg.norm(velocity)),
-            "mean_depth_m": float(np.mean(depths)),
-            "min_depth_m": float(np.min(depths)),
-            "max_depth_m": float(np.max(depths)),
+            "mean_depth": mean_d,
+            "min_depth": min_d,
+            "max_depth": max_d,
         }
         self.last_visualization = {
             "iteration": int(iteration),
@@ -448,6 +625,9 @@ class IBVSController:
 
     def should_stop(self) -> Optional[str]:
         """Stop when RMS feature reprojection error <= stop_residual_px."""
+        fault_reason = self.last_info.get("fault_reason")
+        if fault_reason:
+            return str(fault_reason)
         rms = self.last_info.get("residual_rms_px")
         if rms is None or not np.isfinite(float(rms)):
             return None
@@ -510,6 +690,9 @@ class PhotometricController:
         depth_provider: Optional[Callable[[NDArray[np.float32]], NDArray[np.float32]]] = None,
         seed: int = 0,
         stop_mse_per_px: float = 2.0e-6,
+        stop_ssd: Optional[float] = None,
+        min_interaction_rank: int = DEFAULT_MIN_INTERACTION_RANK,
+        max_interaction_condition: Optional[float] = DEFAULT_MAX_INTERACTION_CONDITION,
     ) -> None:
         if scene is None and depth_provider is None:
             raise ValueError(
@@ -530,10 +713,17 @@ class PhotometricController:
         self.huber_k = None if huber_k is None else float(huber_k)
         self.use_intrinsic_depth = bool(use_intrinsic_depth)
         self.depth_provider = depth_provider
-        # ViSP-style stop: per-pixel mean square intensity error below
-        # threshold. Default ~2e-6 matches `SSD>10000` on 320x240 [0,255]
-        # when our intensities live in [0,1] (10000 / 255^2 / 76800).
+        # ViSP-style stop is SSD on the feature error vector. If stop_ssd is
+        # None, derive the SSD threshold from the legacy per-pixel MSE knob.
         self.stop_mse_per_px = float(stop_mse_per_px)
+        self.stop_ssd = None if stop_ssd is None else float(stop_ssd)
+        (
+            self.min_interaction_rank,
+            self.max_interaction_condition,
+        ) = validate_interaction_guard(
+            min_interaction_rank,
+            max_interaction_condition,
+        )
 
         self._rng = np.random.default_rng(int(seed))
 
@@ -545,6 +735,7 @@ class PhotometricController:
         # Desired-side cache (per target).
         self._cached_target_id = None
         self._I_star_flat = None
+        self._I_star_raw_flat = None
         self._Z_star_flat_masked = None
         self._xn_flat_masked = None
         self._yn_flat_masked = None
@@ -567,7 +758,8 @@ class PhotometricController:
         if self._cached_target_id != id(target) or int(iteration) == 0:
             self._build_target_cache(target)
 
-        e, L, depths_used = self._compute_residual_and_L(rendered)
+        e, L, depths_used, raw_error = self._compute_residual_and_L(rendered)
+        control_error = e.copy()
 
         huber_k_active = None
         if self.use_huber and e.size > 0:
@@ -576,19 +768,53 @@ class PhotometricController:
             e = e * sqrt_w
             L = L * sqrt_w[:, None]
 
+        interaction_info = interaction_matrix_diagnostics(
+            L,
+            self.min_interaction_rank,
+            self.max_interaction_condition,
+        )
+        fault_reason = None
         if e.size < 6:
+            fault_reason = "measurement_invalid_not_enough_pixels"
+            velocity = np.zeros(6, dtype=np.float32)
+        elif not np.isfinite(e).all() or not np.isfinite(L).all():
+            fault_reason = "measurement_invalid_nonfinite"
             velocity = np.zeros(6, dtype=np.float32)
         else:
-            H = L.T @ L
-            b = L.T @ e
-            H_reg = H + 1e-9 * np.eye(6, dtype=np.float32)
-            try:
-                step = np.linalg.solve(H_reg, b)
-            except np.linalg.LinAlgError:
-                step = np.linalg.pinv(L) @ e
-            velocity = (-self.gain * step).astype(np.float32)
+            interaction_fault = interaction_fault_reason(interaction_info)
+            if interaction_fault is not None:
+                fault_reason = interaction_fault
+                velocity = np.zeros(6, dtype=np.float32)
+            else:
+                H = L.T @ L
+                b = L.T @ e
+                H_reg = H + 1e-9 * np.eye(6, dtype=np.float32)
+                try:
+                    step = np.linalg.solve(H_reg, b)
+                except np.linalg.LinAlgError:
+                    step = np.linalg.pinv(L) @ e
+                velocity = (-self.gain * step).astype(np.float32)
 
-        n_used = int(e.size)
+        n_used = int(control_error.size)
+        control_residual_norm = (
+            float(np.linalg.norm(control_error)) if control_error.size else float("nan")
+        )
+        control_residual_ssd = (
+            float(np.square(control_error).sum()) if control_error.size else float("nan")
+        )
+        control_residual_mse = (
+            float(np.square(control_error).mean()) if control_error.size else float("nan")
+        )
+        weighted_residual_norm = float(np.linalg.norm(e)) if e.size else float("nan")
+        weighted_residual_ssd = float(np.square(e).sum()) if e.size else float("nan")
+        weighted_residual_mse = float(np.square(e).mean()) if e.size else float("nan")
+        raw_image_ssd = (
+            float(np.square(raw_error).sum()) if raw_error.size else float("nan")
+        )
+        raw_image_mse = (
+            float(np.square(raw_error).mean()) if raw_error.size else float("nan")
+        )
+        stop_ssd_threshold = self._stop_ssd_threshold(n_used)
         if depths_used.size:
             mean_d = float(depths_used.mean())
             min_d = float(depths_used.min())
@@ -604,15 +830,27 @@ class PhotometricController:
             "num_inlier_matches": n_used,
             "num_cached_features": n_used,
             "num_dropped_features": int(self._num_total_valid - n_used),
-            "residual_norm": float(np.linalg.norm(e)),
-            "residual_ssd": float(np.square(e).sum()),
-            "residual_mse_per_px": (
-                float(np.square(e).mean()) if e.size else 0.0
-            ),
+            "measurement_valid": fault_reason is None,
+            "fault_reason": fault_reason,
+            "residual_norm": control_residual_norm,
+            "residual_ssd": control_residual_ssd,
+            "residual_mse_per_px": control_residual_mse,
+            "control_residual_norm": control_residual_norm,
+            "control_residual_ssd": control_residual_ssd,
+            "control_residual_mse_per_px": control_residual_mse,
+            "weighted_residual_norm": weighted_residual_norm,
+            "weighted_residual_ssd": weighted_residual_ssd,
+            "weighted_residual_mse_per_px": weighted_residual_mse,
+            "raw_image_ssd": raw_image_ssd,
+            "raw_image_mse_per_px": raw_image_mse,
+            "stop_ssd": control_residual_ssd,
+            "stop_ssd_threshold": stop_ssd_threshold,
+            "stop_mse_per_px_threshold": self.stop_mse_per_px,
+            **interaction_info,
             "velocity_norm": float(np.linalg.norm(velocity)),
-            "mean_depth_m": mean_d,
-            "min_depth_m": min_d,
-            "max_depth_m": max_d,
+            "mean_depth": mean_d,
+            "min_depth": min_d,
+            "max_depth": max_d,
             "num_pixels_used": n_used,
             "use_gzn": self.use_gzn,
             "huber_k_active": (
@@ -623,20 +861,37 @@ class PhotometricController:
             "iteration": int(iteration),
             "feature_mode": "photometric",
             "num_pixels_used": n_used,
-            "residual_norm": float(np.linalg.norm(e)),
+            "residual_norm": control_residual_norm,
+            "residual_ssd": control_residual_ssd,
         }
         return velocity
 
     def should_stop(self) -> Optional[str]:
-        """ViSP-style stop: mean(e^2) per pixel <= stop_mse_per_px."""
-        mse = self.last_info.get("residual_mse_per_px")
-        if mse is None or not np.isfinite(float(mse)):
+        """ViSP-style stop: SSD of the feature error vector below threshold."""
+        fault_reason = self.last_info.get("fault_reason")
+        if fault_reason:
+            return str(fault_reason)
+        ssd = self.last_info.get("stop_ssd")
+        threshold = self.last_info.get("stop_ssd_threshold")
+        if (
+            ssd is None
+            or threshold is None
+            or not np.isfinite(float(ssd))
+            or not np.isfinite(float(threshold))
+        ):
             return None
-        if float(mse) <= self.stop_mse_per_px:
-            return "photometric_mse_below_threshold"
+        if float(ssd) <= float(threshold):
+            return "photometric_ssd_below_threshold"
         return None
 
     # -- internals -------------------------------------------------------------
+
+    def _stop_ssd_threshold(self, num_pixels: int) -> float:
+        if self.stop_ssd is not None:
+            return float(self.stop_ssd)
+        if int(num_pixels) <= 0:
+            return float("nan")
+        return float(self.stop_mse_per_px) * float(num_pixels)
 
     def _depth(self, image, camera=None):
         if self.depth_provider is not None:
@@ -677,7 +932,12 @@ class PhotometricController:
                 "called before _build_target_cache."
             )
 
+        I_star_raw = image_to_gray(target)
         I_star = self._preprocess(target)
+        if I_star_raw.shape != I_star.shape:
+            raise RuntimeError(
+                f"raw target shape {I_star_raw.shape} != feature image shape {I_star.shape}"
+            )
         gx_star, gy_star = image_gradient(I_star)
         Z_star = self._depth(target, camera=self.target_camera)
         if Z_star.shape != I_star.shape:
@@ -708,29 +968,40 @@ class PhotometricController:
 
         flat = lambda a: a.reshape(-1)
         self._I_star_flat = flat(I_star)[idx].astype(np.float32, copy=False)
+        self._I_star_raw_flat = flat(I_star_raw)[idx].astype(np.float32, copy=False)
         self._Z_star_flat_masked = flat(Z_star)[idx].astype(np.float32, copy=False)
         self._xn_flat_masked = flat(self._x_norm_full)[idx].astype(np.float32, copy=False)
         self._yn_flat_masked = flat(self._y_norm_full)[idx].astype(np.float32, copy=False)
         self._mask_idx = idx
         self._cached_target_id = id(target)
 
-    def _compute_residual_and_L(self, rendered: NDArray[np.float32]) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
+    def _compute_residual_and_L(self, rendered: NDArray[np.float32]) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
+        I_cur_raw = image_to_gray(rendered)
         I_cur = self._preprocess(rendered)
+        if I_cur_raw.shape != I_cur.shape:
+            raise RuntimeError(
+                f"raw current shape {I_cur_raw.shape} != feature image shape {I_cur.shape}"
+            )
         gx_cur, gy_cur = image_gradient(I_cur)
 
         idx = self._mask_idx
         if idx is None or idx.size == 0:
             empty = np.zeros((0,), dtype=np.float32)
-            return empty, np.zeros((0, 6), dtype=np.float32), empty
+            return empty, np.zeros((0, 6), dtype=np.float32), empty, empty
 
         I_cur_m = I_cur.reshape(-1)[idx]
+        I_cur_raw_m = I_cur_raw.reshape(-1)[idx]
         gx_m = gx_cur.reshape(-1)[idx]
         gy_m = gy_cur.reshape(-1)[idx]
 
         e = (I_cur_m - self._I_star_flat).astype(np.float32, copy=False)
+        raw_error = (I_cur_raw_m - self._I_star_raw_flat).astype(
+            np.float32,
+            copy=False,
+        )
         L = photometric_interaction(
             gx_m, gy_m,
             self._xn_flat_masked, self._yn_flat_masked,
             self._Z_star_flat_masked,
         )
-        return e, L, self._Z_star_flat_masked
+        return e, L, self._Z_star_flat_masked, raw_error

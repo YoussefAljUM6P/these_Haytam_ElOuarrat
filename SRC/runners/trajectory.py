@@ -20,9 +20,14 @@ from runners.servo_frames import (
     PROJECT_ROOT,
     RUNS_ROOT,
     camera_metadata,
+    controller_error_display,
+    format_percent,
+    format_stat,
+    gap_closed_percent,
     frame_id_from_path,
     load_rgb,
     rotation_error_from_pose,
+    short_stop_reason,
     sorted_frame_ids,
     translation_error_from_pose,
 )
@@ -48,7 +53,10 @@ RATIO = 1
 START_INDEX = 1
 MAX_PAIRS = None
 STOP_RESIDUAL_PX = 0.5      # IBVS: RMS reprojection error (px)
-STOP_MSE_PER_PX = 2.0e-6    # photometric: mean(e^2) per pixel on [0, 1] floats
+STOP_MSE_PER_PX = 2.0e-6    # legacy photometric MSE; used when STOP_SSD is None
+STOP_SSD = None             # photometric: ViSP-style SSD threshold, or None
+MIN_INTERACTION_RANK = 6
+MAX_INTERACTION_CONDITION = 1.0e8
 RPE_DELTA = 1
 SAVE_TASK_VIZ = True
 TASK_VIZ_EVERY = 1
@@ -296,9 +304,9 @@ def evaluate_and_plot(timestamps, sim_poses, gt_poses, out_dir, scene_name):
     rpe_r.process_data(pair)
 
     metrics_out = {
-        "ape_translation_m": stat_dict(ape_t),
+        "ape_translation": stat_dict(ape_t),
         "ape_rotation_deg": stat_dict(ape_r),
-        "rpe_translation_m": stat_dict(rpe_t),
+        "rpe_translation": stat_dict(rpe_t),
         "rpe_rotation_deg": stat_dict(rpe_r),
         "num_poses": int(traj_gt_synced.num_poses),
     }
@@ -331,9 +339,9 @@ def evaluate_and_plot(timestamps, sim_poses, gt_poses, out_dir, scene_name):
     fig_err = plt.figure(figsize=(10, 4))
     ax_err = fig_err.add_subplot(111)
     ax_err.plot(traj_sim_synced.timestamps, ape_t.error,
-                color="red", label="APE trans (m)")
+                color="red", label="APE trans")
     ax_err.set_xlabel("task index")
-    ax_err.set_ylabel("APE trans (m)")
+    ax_err.set_ylabel("APE trans")
     ax_err.set_title(f"{scene_name}: APE translation per task")
     ax_err.grid(True, alpha=0.3)
     ax_err.legend()
@@ -355,8 +363,8 @@ def evaluate_and_plot(timestamps, sim_poses, gt_poses, out_dir, scene_name):
     plt.close(fig_rot)
 
     print(f"\n=== {scene_name} evo metrics ({metrics_out['num_poses']} poses) ===")
-    for name in ("ape_translation_m", "ape_rotation_deg",
-                 "rpe_translation_m", "rpe_rotation_deg"):
+    for name in ("ape_translation", "ape_rotation_deg",
+                 "rpe_translation", "rpe_rotation_deg"):
         stats = metrics_out[name]
         print(
             f"  {name}: "
@@ -382,8 +390,12 @@ PER_TASK_FIELDS = [
     "iterations_run",
     "dynamic_w",
     "feature_err_px",
+    "final_residual",
+    "diverged",
     "stop_reason",
-    "translation_error_m",
+    "initial_translation_gap",
+    "translation_gap",
+    "gap_closed_pct",
     "rotation_error_deg",
     "fps",
     "render_fps",
@@ -462,11 +474,39 @@ def find_latest_resumable_run(renderer, tag):
 
 
 def run_scene(scene_name, run_root, resume=False):
+    import numpy as np
+
     from controllers import IBVSController, PhotometricController
     from features import FeatureMatcher
     from photometric import PhotometricControllerTorch
     from servo import copy_camera_with_pose, run_servo_loop
-    from viz import save_side_by_side
+    from viz import save_current_desired_error_visualization, save_side_by_side
+
+    DIVERGE_RESIDUAL_PX = 1000.0
+    DIVERGE_MSE_PER_PX = 0.01
+
+    def _residual(rendered, target, camera):
+        if CONTROLLER == "ibvs" and isinstance(controller, IBVSController):
+            return float(
+                controller.feature_error_px(rendered, target, camera)
+            )
+        return float(
+            np.mean(
+                (np.asarray(rendered, dtype=np.float64)
+                 - np.asarray(target, dtype=np.float64)) ** 2
+            )
+        )
+
+    def _diverge_threshold():
+        return DIVERGE_RESIDUAL_PX if CONTROLLER == "ibvs" else DIVERGE_MSE_PER_PX
+
+    def _residual_label():
+        return "feat_err_px" if CONTROLLER == "ibvs" else "mse_per_px"
+
+    def _fmt_residual(value):
+        return (
+            f"{value:.2f}" if CONTROLLER == "ibvs" else f"{value:.3e}"
+        )
 
     scene_dir = PROJECT_ROOT / "DATA" / scene_name
     if not scene_dir.exists():
@@ -494,6 +534,8 @@ def run_scene(scene_name, run_root, resume=False):
             use_intrinsic_depth=(DEPTH_MODE == "intrinsic"),
             ratio=RATIO,
             stop_residual_px=STOP_RESIDUAL_PX,
+            min_interaction_rank=MIN_INTERACTION_RANK,
+            max_interaction_condition=MAX_INTERACTION_CONDITION,
         )
     elif CONTROLLER == "photometric":
         controller = PhotometricController(
@@ -508,6 +550,9 @@ def run_scene(scene_name, run_root, resume=False):
             huber_k=HUBER_K,
             use_intrinsic_depth=(DEPTH_MODE == "intrinsic"),
             stop_mse_per_px=STOP_MSE_PER_PX,
+            stop_ssd=STOP_SSD,
+            min_interaction_rank=MIN_INTERACTION_RANK,
+            max_interaction_condition=MAX_INTERACTION_CONDITION,
         )
     elif CONTROLLER == "photometric_torch":
         controller = PhotometricControllerTorch(
@@ -523,6 +568,9 @@ def run_scene(scene_name, run_root, resume=False):
             use_intrinsic_depth=(DEPTH_MODE == "intrinsic"),
             method="lm",
             stop_mse_per_px=STOP_MSE_PER_PX,
+            stop_ssd=STOP_SSD,
+            min_interaction_rank=MIN_INTERACTION_RANK,
+            max_interaction_condition=MAX_INTERACTION_CONDITION,
         )
     else:
         raise ValueError(f"Unknown CONTROLLER={CONTROLLER!r}")
@@ -598,6 +646,11 @@ def run_scene(scene_name, run_root, resume=False):
         if isinstance(controller, (PhotometricController, PhotometricControllerTorch)):
             controller.set_target_camera(target_camera)
 
+        initial_translation_gap = translation_error_from_pose(
+            current_camera.T_world_cam,
+            target_camera.T_world_cam,
+        )
+
         # Paper eq. 7: dynamically choose iter count for this IBVS launch.
         iters_for_task = int(MINI_ITERATIONS)
         dynamic_w = float("nan")
@@ -656,6 +709,7 @@ def run_scene(scene_name, run_root, resume=False):
 
         translation_err = translation_error_from_pose(sim_T, gt_T)
         rotation_err = rotation_error_from_pose(sim_T, gt_T)
+        closed_pct = gap_closed_percent(initial_translation_gap, translation_err)
 
         sim_poses.append(sim_T)
         gt_poses.append(gt_T)
@@ -671,7 +725,16 @@ def run_scene(scene_name, run_root, resume=False):
             if final_render is None:
                 final_render = scene.render(final_camera)
             task_viz_path = viz_dir / f"task_{task_idx:04d}_final_vs_target.png"
-            save_side_by_side(final_render, target_image, task_viz_path)
+            if CONTROLLER in ("photometric", "photometric_torch"):
+                save_current_desired_error_visualization(
+                    final_render,
+                    target_image,
+                    task_viz_path,
+                    current_label="final",
+                    desired_label="desired",
+                )
+            else:
+                save_side_by_side(final_render, target_image, task_viz_path)
 
         timing = result.get("timing", {}) or {}
         task_row = {
@@ -686,7 +749,9 @@ def run_scene(scene_name, run_root, resume=False):
             "dynamic_w": float(dynamic_w),
             "feature_err_px": float(feature_err_px),
             "stop_reason": result["stop_reason"],
-            "translation_error_m": float(translation_err),
+            "initial_translation_gap": float(initial_translation_gap),
+            "translation_gap": float(translation_err),
+            "gap_closed_pct": float(closed_pct),
             "rotation_error_deg": float(rotation_err),
             "fps": float(timing.get("fps", 0.0)),
             "render_fps": float(timing.get("render_fps", 0.0)),
@@ -700,18 +765,46 @@ def run_scene(scene_name, run_root, resume=False):
 
         write_tum(sim_tum, timestamps, sim_poses)
         write_tum(gt_tum, timestamps, gt_poses)
+        final_rendered = result.get("rendered")
+        if final_rendered is None:
+            final_rendered = scene.render(final_camera)
+        final_resid = _residual(final_rendered, target_image, final_camera)
+
+        threshold = _diverge_threshold()
+        diverged = final_resid > threshold
+
+        task_row["final_residual"] = float(final_resid)
+        task_row["diverged"] = int(bool(diverged))
         append_task_row(csv_path, task_row)
 
+        residual_str = f"{_residual_label()}={_fmt_residual(final_resid)}"
+        diverge_tag = " DIVERGED" if diverged else ""
+        last_history = result["history"][-1] if result["history"] else {}
+        last_info = last_history.get("controller_info", {})
+        err_label, err_value = controller_error_display(last_info)
+
         print(
-            f"[{scene_name}] task {task_idx:04d}: "
-            f"{src_frame_id} -> {tgt_frame_id} "
-            f"iters={len(result['history'])}/{iters_for_task}/{MINI_ITERATIONS} "
-            f"w={dynamic_w:.3f} feat_err_px={feature_err_px:.2f} "
-            f"trans_err={translation_err * 1000.0:.4f} "
-            f"rot_err={rotation_err:.8e} "
+            f"[{scene_name}] task={task_idx:04d} "
+            f"{src_frame_id}->{tgt_frame_id} "
+            f"iters={len(result['history'])}/{MINI_ITERATIONS} "
+            f"stop={short_stop_reason(result['stop_reason'])} "
+            f"{err_label}={err_value} "
+            f"final_{residual_str} "
+            f"t_gap={format_stat(translation_err, 6)} "
+            f"rot_gap={format_stat(rotation_err, 2)}deg "
+            f"closed={format_percent(closed_pct)} "
             f"fps={task_row['fps']:.1f} "
             f"render_ms={task_row['render_ms_mean']:.2f}"
+            f"{diverge_tag}"
         )
+
+        if diverged:
+            print(
+                f"[{scene_name}] DIVERGED at task {task_idx:04d}: "
+                f"{_residual_label()}={_fmt_residual(final_resid)} > "
+                f"{_fmt_residual(threshold)}. Aborting run."
+            )
+            raise SystemExit(1)
 
         current_camera = copy_camera_with_pose(target_camera, sim_T)
 
@@ -733,6 +826,7 @@ def run_scene(scene_name, run_root, resume=False):
         "scene": scene_name,
         "scene_dir": str(scene_dir),
         "renderer": RENDERER,
+        "controller": CONTROLLER,
         "nerf_render_scale": float(NERF_RENDER_SCALE),
         "mesh_path": (
             str(scene_dir / "mesh.ply") if RENDERER == "mesh" else None
@@ -748,6 +842,13 @@ def run_scene(scene_name, run_root, resume=False):
         "max_pairs": MAX_PAIRS,
         "stop_residual_px": float(STOP_RESIDUAL_PX),
         "stop_mse_per_px": float(STOP_MSE_PER_PX),
+        "stop_ssd": (None if STOP_SSD is None else float(STOP_SSD)),
+        "min_interaction_rank": int(MIN_INTERACTION_RANK),
+        "max_interaction_condition": (
+            None
+            if MAX_INTERACTION_CONDITION is None
+            else float(MAX_INTERACTION_CONDITION)
+        ),
         "save_task_viz": bool(SAVE_TASK_VIZ),
         "task_viz_every": int(TASK_VIZ_EVERY),
         "num_tasks": len(per_task_rows),
@@ -780,7 +881,12 @@ def run(args):
     if applied_config:
         print(f"Applied trajectory config: {format_applied_config(applied_config)}")
 
-    tag = RUN_TAG or f"{FEATURE_METHOD}_stride{STRIDE}_iters{MINI_ITERATIONS}"
+    if RUN_TAG:
+        tag = RUN_TAG
+    elif CONTROLLER == "ibvs":
+        tag = f"{FEATURE_METHOD}_stride{STRIDE}_iters{MINI_ITERATIONS}"
+    else:
+        tag = f"{CONTROLLER}_stride{STRIDE}_iters{MINI_ITERATIONS}"
 
     resume = args.resume is not None
     if resume:

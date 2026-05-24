@@ -206,24 +206,45 @@ def test_zero_error_returns_zero_velocity():
         raise AssertionError("controller used 0 pixels")
 
 
-def test_translation_residual_drives_nonzero_velocity():
+def test_rank_deficient_photometric_returns_fault():
     cam = make_camera()
     H, W = cam.H, cam.W
-    # Build a vertical-stripe target (gradient in x), so x-shift produces
-    # a clean residual signal.
     base = np.linspace(0.1, 0.9, W, dtype=np.float32)
     target = np.zeros((H, W, 3), dtype=np.float32)
     target[:, :, 0] = base[None, :]
     target[:, :, 1] = base[None, :]
     target[:, :, 2] = base[None, :]
 
-    # Shift "rendered" right by 1 pixel to simulate a camera +x displacement.
     rendered = np.zeros_like(target)
     rendered[:, 1:, :] = target[:, :-1, :]
     rendered[:, 0, :] = target[:, 0, :]
 
     ctrl = _make_controller_with_constant_depth(cam, target, gain=1.0)
     v = ctrl(rendered, target, cam, iteration=0)
+    if not np.allclose(v, 0.0, atol=1e-8):
+        raise AssertionError(f"rank-deficient target should return zero velocity, got {v}")
+    if ctrl.last_info["fault_reason"] != "measurement_invalid_rank_deficient":
+        raise AssertionError(f"wrong fault: {ctrl.last_info}")
+    if ctrl.should_stop() != "measurement_invalid_rank_deficient":
+        raise AssertionError(f"wrong stop reason: {ctrl.should_stop()}")
+
+
+def test_textured_residual_drives_nonzero_velocity():
+    cam = make_camera()
+    H, W = cam.H, cam.W
+    rng = np.random.default_rng(3)
+    target = rng.uniform(0.1, 0.9, (H, W, 3)).astype(np.float32)
+
+    rendered = np.zeros_like(target)
+    rendered[:, 1:, :] = target[:, :-1, :]
+    rendered[:, 0, :] = target[:, 0, :]
+
+    ctrl = _make_controller_with_constant_depth(cam, target, gain=1.0)
+    v = ctrl(rendered, target, cam, iteration=0)
+    if ctrl.last_info["fault_reason"] is not None:
+        raise AssertionError(f"unexpected fault: {ctrl.last_info}")
+    if ctrl.last_info["interaction_rank"] < 6:
+        raise AssertionError(f"expected full rank, got {ctrl.last_info}")
     if not np.isfinite(v).all():
         raise AssertionError(f"v must be finite, got {v}")
     if float(np.linalg.norm(v)) <= 0.0:
@@ -256,7 +277,7 @@ def test_last_info_has_ibvs_parity_keys():
     required = {
         "iteration", "feature_mode", "num_raw_matches", "num_inlier_matches",
         "num_cached_features", "num_dropped_features", "residual_norm",
-        "velocity_norm", "mean_depth_m", "min_depth_m", "max_depth_m",
+        "velocity_norm", "mean_depth", "min_depth", "max_depth",
     }
     missing = required - set(ctrl.last_info)
     if missing:
@@ -328,7 +349,7 @@ def _camera_at(translation_xyz, rotation_axis_angle_deg, W=128, H=128, f=160.0):
 
 
 def _try_sim_to_sim():
-    """Returns (initial_err, final_err) translation in metres for a small task,
+    """Returns scene-scale translation gap for a small task,
     or None if the renderer (EGL) is unavailable in this environment."""
     try:
         scene, _ = _build_textured_plane_scene()
@@ -390,14 +411,14 @@ def test_sim_to_sim_translation():
     if final >= initial:
         raise AssertionError(
             f"photometric controller failed to reduce translation error: "
-            f"{initial:.4f} -> {final:.4f} m"
+            f"{initial:.4f} -> {final:.4f}"
         )
     if final >= 0.5 * initial:
         raise AssertionError(
             f"photometric controller did not converge enough: "
-            f"{initial:.4f} -> {final:.4f} m (need final < 0.5 * initial)"
+            f"{initial:.4f} -> {final:.4f} (need final < 0.5 * initial)"
         )
-    print(f"  sim-to-sim translation: {initial * 1000:.2f}mm -> {final * 1000:.2f}mm")
+    print(f"  sim-to-sim t_gap: {initial:.6f} -> {final:.6f}")
 
 
 # ---- runner ----------------------------------------------------------------
@@ -414,7 +435,8 @@ def main():
     test_huber_auto_k_from_mad()
     test_missing_target_camera_raises()
     test_zero_error_returns_zero_velocity()
-    test_translation_residual_drives_nonzero_velocity()
+    test_rank_deficient_photometric_returns_fault()
+    test_textured_residual_drives_nonzero_velocity()
     test_target_change_invalidates_cache()
     test_last_info_has_ibvs_parity_keys()
     test_sim_to_sim_translation()

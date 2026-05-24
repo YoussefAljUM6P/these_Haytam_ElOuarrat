@@ -147,9 +147,9 @@ def main():
         rpe_r.process_data(pair)
 
         per_run_metrics[label] = {
-            "ape_translation_m": stat_dict(ape_t),
+            "ape_translation": stat_dict(ape_t),
             "ape_rotation_deg": stat_dict(ape_r),
-            "rpe_translation_m": stat_dict(rpe_t),
+            "rpe_translation": stat_dict(rpe_t),
             "rpe_rotation_deg": stat_dict(rpe_r),
             "num_poses": int(traj_gt_synced.num_poses),
             "run_dir": str(run_dir),
@@ -191,7 +191,7 @@ def main():
     for label, (ts, err) in per_run_ape_t_err.items():
         ax_err.plot(ts, err, color=color_map[label], label=label)
     ax_err.set_xlabel("task index")
-    ax_err.set_ylabel("APE trans (m)")
+    ax_err.set_ylabel("APE trans")
     ax_err.set_title("APE translation per task")
     ax_err.grid(True, alpha=0.3)
     ax_err.legend()
@@ -222,8 +222,8 @@ def main():
     ]
     for label, m in per_run_metrics.items():
         lines.append(f"[{label}]  ({m['num_poses']} poses)  run_dir={m['run_dir']}")
-        for k in ("ape_translation_m", "ape_rotation_deg",
-                  "rpe_translation_m", "rpe_rotation_deg"):
+        for k in ("ape_translation", "ape_rotation_deg",
+                  "rpe_translation", "rpe_rotation_deg"):
             s = m[k]
             lines.append(
                 f"  {k}: "

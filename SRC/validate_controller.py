@@ -86,6 +86,36 @@ def test_shifted_features_return_finite_velocity():
         raise AssertionError("Controller did not record enough inlier matches")
 
 
+def test_ibvs_stop_uses_pixel_rms_not_normalized_error():
+    camera = make_camera()
+    rendered = np.zeros((64, 64, 3), dtype=np.float32)
+    target = rendered.copy()
+    controller = IBVSController(
+        matcher=DummyMatcher(offset=(2.0, -1.0)),
+        depth_provider=constant_depth,
+        stop_residual_px=0.5,
+    )
+
+    controller(rendered, target, camera, iteration=0)
+    rms_px = controller.last_info["residual_rms_px"]
+    if not np.isclose(rms_px, np.sqrt(2.5), atol=1e-6):
+        raise AssertionError(f"expected pixel RMS sqrt(2.5), got {rms_px}")
+    if controller.should_stop() is not None:
+        raise AssertionError(
+            "2px feature error must not stop with a 0.5px threshold; "
+            f"last_info={controller.last_info}"
+        )
+
+    small = IBVSController(
+        matcher=DummyMatcher(offset=(0.1, -0.1)),
+        depth_provider=constant_depth,
+        stop_residual_px=0.5,
+    )
+    small(rendered, target, camera, iteration=0)
+    if small.should_stop() != "ibvs_rms_below_threshold":
+        raise AssertionError(f"small pixel error should stop, got {small.last_info}")
+
+
 def test_ratio_one_matches_every_iteration():
     camera = make_camera()
     rendered = np.zeros((64, 64, 3), dtype=np.float32)
@@ -156,6 +186,7 @@ def main():
     test_interaction_matrix_shape()
     test_zero_error_returns_zero_velocity()
     test_shifted_features_return_finite_velocity()
+    test_ibvs_stop_uses_pixel_rms_not_normalized_error()
     test_ratio_one_matches_every_iteration()
     test_ratio_zero_matches_once_then_reprojects()
     test_ratio_n_refreshes_every_n_iterations()

@@ -251,111 +251,255 @@ def wizard():
             )
         console.print(table)
 
-    def build_common(controller, renderers):
-        renderer = ask_select(
-            "Renderer:",
-            [Choice(r, value=r) for r in renderers],
-            default=renderers[0],
-        )
+    # --- declarative question helpers (questionary.prompt with when=) ------
 
-        cfg = {"renderer": renderer, "controller": controller}
+    def _text_validator(caster, optional):
+        def _v(text):
+            t = text.strip()
+            if not t:
+                return True
+            if optional and t.lower() in {"none", "null"}:
+                return True
+            try:
+                caster(t)
+                return True
+            except Exception as exc:
+                return str(exc)
+        return _v
 
-        cfg["depth_mode"] = ask_select(
-            "Depth mode:",
-            [
-                Choice("intrinsic  — scene.render_depth()", value="intrinsic"),
-                Choice("learned    — MoGe2", value="learned"),
-            ],
-            default="intrinsic",
-        )
+    def _text_filter(default, caster, optional):
+        def _f(text):
+            t = text.strip() if isinstance(text, str) else text
+            if optional and (not t or (isinstance(t, str) and t.lower() in {"none", "null"})):
+                return None
+            if not t:
+                return default
+            return caster(t)
+        return _f
 
-        cfg["feature_method"] = ask_select(
-            "Feature method:",
-            [Choice(m, value=m) for m in FEATURE_METHODS],
-            default="sift",
-        )
+    def q_select(name, message, choices, default=None, when=None):
+        q = {
+            "type": "select",
+            "name": name,
+            "message": message,
+            "choices": choices,
+            "qmark": "›",
+            "style": QSTYLE,
+        }
+        if default is not None:
+            q["default"] = default
+        if when is not None:
+            q["when"] = when
+        return q
 
-        cfg["gain_ibvs"] = ask_text("Gain IBVS:", 0.75, float)
+    def q_text(name, message, default, caster=str, optional=False, when=None):
+        q = {
+            "type": "text",
+            "name": name,
+            "message": message,
+            "default": "" if default is None else str(default),
+            "validate": _text_validator(caster, optional),
+            "filter": _text_filter(default, caster, optional),
+            "qmark": "›",
+            "style": QSTYLE,
+        }
+        if when is not None:
+            q["when"] = when
+        return q
 
-        if controller in ("photometric", "photometric_torch"):
-            console.rule("[bold magenta]Photometric controller knobs[/]")
-            cfg["gain_photo"] = ask_text("Gain photometric:", 0.005, float)
-            cfg["sigma_blur"] = ask_text("Sigma blur:", 1.0, float)
-            cfg["use_gzn"] = ask_confirm("Use GZN?", default=True)
-            cfg["grad_percentile"] = ask_text("Grad percentile:", 50.0, float)
-            cfg["photometric_max_pixels"] = ask_text(
-                "Photometric max pixels:", 50000, int
-            )
-            cfg["use_huber"] = ask_confirm("Use Huber loss?", default=True)
-            cfg["huber_k"] = ask_text(
-                "Huber k (blank = auto):", None, float, optional=True
-            )
-        return cfg
+    def q_confirm(name, message, default=True, when=None):
+        q = {
+            "type": "confirm",
+            "name": name,
+            "message": message,
+            "default": default,
+            "qmark": "›",
+            "style": QSTYLE,
+        }
+        if when is not None:
+            q["when"] = when
+        return q
+
+    def run_prompt(questions):
+        if not questions:
+            return {}
+        ans = questionary.prompt(questions)
+        if not ans and "when" not in questions[0]:
+            raise KeyboardInterrupt
+        return ans
+
+    # --- per-controller capability ------------------------------------------
+
+    def common_questions(controller, renderers):
+        is_ibvs = controller == "ibvs"
+        is_photo = controller in ("photometric", "photometric_torch")
+
+        qs = [
+            q_select(
+                "renderer",
+                "Renderer:",
+                [Choice(r, value=r) for r in renderers],
+                default=renderers[0],
+            ),
+            q_select(
+                "depth_mode",
+                "Depth mode:",
+                [
+                    Choice("intrinsic  — scene.render_depth()", value="intrinsic"),
+                    Choice("learned    — MoGe2", value="learned"),
+                ],
+                default="intrinsic",
+            ),
+        ]
+        if is_ibvs:
+            qs += [
+                q_select(
+                    "feature_method",
+                    "Feature method:",
+                    [Choice(m, value=m) for m in FEATURE_METHODS],
+                    default="sift",
+                ),
+                q_text("gain_ibvs", "Gain IBVS:", 0.75, float),
+            ]
+        if is_photo:
+            qs += [
+                q_text("gain_photo", "Gain photometric:", 0.005, float),
+                q_text("sigma_blur", "Sigma blur:", 1.0, float),
+                q_confirm("use_gzn", "Use GZN?", default=True),
+                q_text("grad_percentile", "Grad percentile:", 50.0, float),
+                q_text("photometric_max_pixels", "Photometric max pixels:", 50000, int),
+                q_confirm("use_huber", "Use Huber loss?", default=True),
+                q_text("huber_k", "Huber k (blank = auto):", None, float, optional=True),
+            ]
+        return qs
 
     def build_servo_frames_config(controller, scene_name, renderers):
-        cfg = {"kind": "servo_frames", "scene_dir": scene_name}
-        cfg.update(build_common(controller, renderers))
+        is_ibvs = controller == "ibvs"
+        is_photo = controller in ("photometric", "photometric_torch")
+
+        cfg = {"kind": "servo_frames", "scene_dir": scene_name, "controller": controller}
+
+        if is_photo:
+            console.rule("[bold magenta]Photometric controller knobs[/]")
+        cfg.update(run_prompt(common_questions(controller, renderers)))
 
         console.rule("[bold magenta]Frame selection[/]")
-        cfg["start_index"] = ask_text("Start index:", 1, int)
-        target = ask_text(
-            "Target index (blank → use index_away):", None, int, optional=True
-        )
-        if target is None:
-            cfg["index_away"] = ask_text("Index away:", 1, int)
-            cfg["target_index"] = None
-        else:
-            cfg["target_index"] = target
-            cfg["index_away"] = 1
+        frame_qs = [
+            q_text("start_index", "Start index:", 1, int),
+            q_text(
+                "target_index",
+                "Target index (blank → use index_away):",
+                None,
+                int,
+                optional=True,
+            ),
+            q_text(
+                "index_away",
+                "Index away:",
+                1,
+                int,
+                when=lambda a: a.get("target_index") is None,
+            ),
+        ]
+        frame_ans = run_prompt(frame_qs)
+        cfg["start_index"] = frame_ans["start_index"]
+        cfg["target_index"] = frame_ans.get("target_index")
+        cfg["index_away"] = frame_ans.get("index_away", 1)
 
         console.rule("[bold magenta]Servo loop[/]")
-        cfg["iterations"] = ask_text("Iterations:", 100, int)
-        cfg["dt"] = ask_text("dt:", 1.0, float)
-        cfg["min_features"] = ask_text("Min features:", 3, int)
-        cfg["ratio"] = ask_text("Match ratio (0 = match once):", 1, int)
-        cfg["viz_iter"] = ask_text("Viz every N iters (0 disables):", 1, int)
-        cfg["stop_residual_px"] = ask_text(
-            "IBVS stop: RMS reprojection error (px):", 0.5, float
-        )
-        cfg["stop_mse_per_px"] = ask_text(
-            "Photometric stop: mean(e^2) per pixel on [0,1]:", 2.0e-6, float
-        )
-        cfg["run_name"] = ask_text(
-            "Run name (blank = auto):", None, str, optional=True
-        )
+        loop_qs = [
+            q_text("iterations", "Iterations:", 100, int),
+            q_text("dt", "dt:", 1.0, float),
+        ]
+        if is_ibvs:
+            loop_qs += [
+                q_text("min_features", "Min features:", 3, int),
+                q_text("ratio", "Match ratio (0 = match once):", 1, int),
+            ]
+        loop_qs += [q_text("viz_iter", "Viz every N iters (0 disables):", 1, int)]
+        if is_ibvs:
+            loop_qs += [
+                q_text(
+                    "stop_residual_px",
+                    "IBVS stop: RMS reprojection error (px):",
+                    0.5,
+                    float,
+                )
+            ]
+        if is_photo:
+            loop_qs += [
+                q_text(
+                    "stop_mse_per_px",
+                    "Photometric stop: mean(e^2) per pixel on [0,1]:",
+                    2.0e-6,
+                    float,
+                )
+            ]
+        loop_qs += [
+            q_text("run_name", "Run name (blank = auto):", None, str, optional=True)
+        ]
+        cfg.update(run_prompt(loop_qs))
         return cfg
 
     def build_trajectory_config(controller, scene_name, renderers):
-        cfg = {"kind": "trajectory", "datasets": [scene_name]}
-        cfg.update(build_common(controller, renderers))
+        is_ibvs = controller == "ibvs"
+        is_photo = controller in ("photometric", "photometric_torch")
+
+        cfg = {"kind": "trajectory", "datasets": [scene_name], "controller": controller}
+
+        if is_photo:
+            console.rule("[bold magenta]Photometric controller knobs[/]")
+        cfg.update(run_prompt(common_questions(controller, renderers)))
 
         if cfg["renderer"] == "nerf":
-            cfg["nerf_render_scale"] = ask_text("NeRF render scale:", 0.25, float)
+            cfg.update(
+                run_prompt([q_text("nerf_render_scale", "NeRF render scale:", 0.25, float)])
+            )
 
         console.rule("[bold magenta]Trajectory pacing[/]")
-        cfg["stride"] = ask_text("Stride between frames:", 1, int)
-        cfg["mini_iterations"] = ask_text("Iterations per mini task:", 30, int)
-        cfg["dt"] = ask_text("dt:", 1.0, float)
-        cfg["min_features"] = ask_text("Min features:", 3, int)
-        cfg["ratio"] = ask_text("Match ratio:", 1, int)
-        cfg["start_index"] = ask_text("Start index:", 1, int)
-        cfg["max_pairs"] = ask_text(
-            "Max pairs (blank = all):", None, int, optional=True
-        )
-        cfg["rpe_delta"] = ask_text("RPE delta:", 1, int)
+        pacing_qs = [
+            q_text("stride", "Stride between frames:", 1, int),
+            q_text("mini_iterations", "Iterations per mini task:", 30, int),
+            q_text("dt", "dt:", 1.0, float),
+        ]
+        if is_ibvs:
+            pacing_qs += [
+                q_text("min_features", "Min features:", 3, int),
+                q_text("ratio", "Match ratio:", 1, int),
+            ]
+        pacing_qs += [
+            q_text("start_index", "Start index:", 1, int),
+            q_text("max_pairs", "Max pairs (blank = all):", None, int, optional=True),
+            q_text("rpe_delta", "RPE delta:", 1, int),
+        ]
+        cfg.update(run_prompt(pacing_qs))
 
         console.rule("[bold magenta]Stopping + viz[/]")
-        cfg["stop_residual_px"] = ask_text(
-            "IBVS stop: RMS reprojection error (px):", 0.5, float
-        )
-        cfg["stop_mse_per_px"] = ask_text(
-            "Photometric stop: mean(e^2) per pixel on [0,1]:", 2.0e-6, float
-        )
-        cfg["save_task_viz"] = ask_confirm("Save per-task viz?", default=True)
-        cfg["task_viz_every"] = ask_text("Save viz every N tasks:", 1, int)
-        cfg["run_tag"] = ask_text(
-            "Run tag (blank = auto):", None, str, optional=True
-        )
+        stop_qs = []
+        if is_ibvs:
+            stop_qs += [
+                q_text(
+                    "stop_residual_px",
+                    "IBVS stop: RMS reprojection error (px):",
+                    0.5,
+                    float,
+                )
+            ]
+        if is_photo:
+            stop_qs += [
+                q_text(
+                    "stop_mse_per_px",
+                    "Photometric stop: mean(e^2) per pixel on [0,1]:",
+                    2.0e-6,
+                    float,
+                )
+            ]
+        stop_qs += [
+            q_confirm("save_task_viz", "Save per-task viz?", default=True),
+            q_text("task_viz_every", "Save viz every N tasks:", 1, int),
+            q_text("run_tag", "Run tag (blank = auto):", None, str, optional=True),
+        ]
+        cfg.update(run_prompt(stop_qs))
         return cfg
 
     def run_inspect_wizard(scene_name, scene_renderers):

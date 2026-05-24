@@ -9,6 +9,7 @@ this module can be imported by `cli.py` without pulling them in.
 
 import csv
 import json
+import math
 import re
 from datetime import datetime
 from pathlib import Path
@@ -34,7 +35,10 @@ MIN_FEATURES = 3
 RATIO = 1
 RUN_NAME = None
 STOP_RESIDUAL_PX = 0.5      # IBVS: RMS reprojection error (px)
-STOP_MSE_PER_PX = 2.0e-6    # photometric: mean(e^2) per pixel on [0, 1] floats
+STOP_MSE_PER_PX = 2.0e-6    # legacy photometric MSE; used when STOP_SSD is None
+STOP_SSD = None             # photometric: ViSP-style SSD threshold, or None
+MIN_INTERACTION_RANK = 6
+MAX_INTERACTION_CONDITION = 1.0e8
 
 CONTROLLER = "ibvs"  # "ibvs", "photometric", or "photometric_torch"
 SIGMA_BLUR = 1.0
@@ -205,8 +209,79 @@ def translation_error_from_pose(T_world_cam, target_T_world_cam):
     return float(np.linalg.norm(delta))
 
 
-def translation_error_m(camera, target_camera):
+def translation_gap(camera, target_camera):
     return translation_error_from_pose(camera.T_world_cam, target_camera.T_world_cam)
+
+
+def format_stat(value, digits=4):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if not math.isfinite(value):
+        return "-"
+    return f"{value:.{int(digits)}f}"
+
+
+def format_sci(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if math.isnan(value):
+        return "-"
+    if math.isinf(value):
+        return "inf" if value > 0 else "-inf"
+    return f"{value:.2e}"
+
+
+def short_stop_reason(reason):
+    if reason in (None, "", "None"):
+        return "-"
+    text = str(reason)
+    prefixes = ("measurement_invalid_", "velocity_invalid_")
+    for prefix in prefixes:
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return text
+
+
+def controller_error_display(info):
+    if info.get("residual_rms_px") is not None:
+        return "err_px", format_stat(info.get("residual_rms_px"), 3)
+    if info.get("stop_ssd") is not None:
+        return "ssd", format_sci(info.get("stop_ssd"))
+    if info.get("raw_image_mse_per_px") is not None:
+        return "raw_mse", format_sci(info.get("raw_image_mse_per_px"))
+    return "err", format_sci(info.get("residual_norm"))
+
+
+def gap_closed_percent(initial_gap, final_gap):
+    try:
+        initial_gap = float(initial_gap)
+        final_gap = float(final_gap)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not math.isfinite(initial_gap) or not math.isfinite(final_gap):
+        return float("nan")
+    if abs(initial_gap) <= 1e-12:
+        return float("nan")
+    return 100.0 * (initial_gap - final_gap) / initial_gap
+
+
+def format_percent(value, digits=1):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if not math.isfinite(value):
+        return "-"
+    return f"{value:.{int(digits)}f}%"
+
+
+def public_controller_info(info):
+    public = dict(info or {})
+    return public
 
 
 def write_history_csv(path, history):
@@ -221,14 +296,36 @@ def write_history_csv(path, history):
         "feature_mode",
         "controller_inliers",
         "residual_norm",
-        "translation_error_m",
+        "residual_norm_px",
+        "residual_rms_px",
+        "residual_ssd",
+        "residual_mse_per_px",
+        "weighted_residual_ssd",
+        "raw_image_ssd",
+        "raw_image_mse_per_px",
+        "stop_ssd",
+        "stop_ssd_threshold",
+        "interaction_rank",
+        "interaction_condition",
+        "interaction_min_singular",
+        "interaction_max_singular",
+        "diff_max",
+        "diff_mean",
+        "translation_gap",
+        "gap_closed_pct",
         "rotation_error_deg",
         "cached_features",
         "dropped_features",
-        "mean_depth_m",
-        "min_depth_m",
-        "max_depth_m",
+        "mean_depth",
+        "min_depth",
+        "max_depth",
         "velocity_norm",
+        "velocity_limited",
+        "velocity_scale",
+        "translation_step",
+        "rotation_step_deg",
+        "raw_translation_step",
+        "raw_rotation_step_deg",
         "vx",
         "vy",
         "vz",
@@ -238,6 +335,7 @@ def write_history_csv(path, history):
         "render_ms",
         "controller_ms",
         "iter_ms",
+        "step_accepted",
         "stop_reason",
     ]
 
@@ -245,7 +343,7 @@ def write_history_csv(path, history):
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for item in history:
-            info = item.get("controller_info", {})
+            info = public_controller_info(item.get("controller_info", {}))
             velocity = np.asarray(item["velocity"], dtype=np.float32)
             writer.writerow({
                 "iteration": item["iteration"],
@@ -254,14 +352,36 @@ def write_history_csv(path, history):
                 "feature_mode": item.get("feature_mode", ""),
                 "controller_inliers": info.get("num_inlier_matches", ""),
                 "residual_norm": info.get("residual_norm", ""),
-                "translation_error_m": item.get("translation_error_m", ""),
+                "residual_norm_px": info.get("residual_norm_px", ""),
+                "residual_rms_px": info.get("residual_rms_px", ""),
+                "residual_ssd": info.get("residual_ssd", ""),
+                "residual_mse_per_px": info.get("residual_mse_per_px", ""),
+                "weighted_residual_ssd": info.get("weighted_residual_ssd", ""),
+                "raw_image_ssd": info.get("raw_image_ssd", ""),
+                "raw_image_mse_per_px": info.get("raw_image_mse_per_px", ""),
+                "stop_ssd": info.get("stop_ssd", ""),
+                "stop_ssd_threshold": info.get("stop_ssd_threshold", ""),
+                "interaction_rank": info.get("interaction_rank", ""),
+                "interaction_condition": info.get("interaction_condition", ""),
+                "interaction_min_singular": info.get("interaction_min_singular", ""),
+                "interaction_max_singular": info.get("interaction_max_singular", ""),
+                "diff_max": item.get("diff_max", ""),
+                "diff_mean": item.get("diff_mean", ""),
+                "translation_gap": item.get("translation_gap", ""),
+                "gap_closed_pct": item.get("gap_closed_pct", ""),
                 "rotation_error_deg": item.get("rotation_error_deg", ""),
                 "cached_features": info.get("num_cached_features", ""),
                 "dropped_features": info.get("num_dropped_features", ""),
-                "mean_depth_m": info.get("mean_depth_m", ""),
-                "min_depth_m": info.get("min_depth_m", ""),
-                "max_depth_m": info.get("max_depth_m", ""),
+                "mean_depth": info.get("mean_depth", ""),
+                "min_depth": info.get("min_depth", ""),
+                "max_depth": info.get("max_depth", ""),
                 "velocity_norm": info.get("velocity_norm", ""),
+                "velocity_limited": int(bool(item.get("velocity_limited", False))),
+                "velocity_scale": item.get("velocity_scale", ""),
+                "translation_step": item.get("translation_step", ""),
+                "rotation_step_deg": item.get("rotation_step_deg", ""),
+                "raw_translation_step": item.get("raw_translation_step", ""),
+                "raw_rotation_step_deg": item.get("raw_rotation_step_deg", ""),
                 "vx": float(velocity[0]),
                 "vy": float(velocity[1]),
                 "vz": float(velocity[2]),
@@ -271,6 +391,7 @@ def write_history_csv(path, history):
                 "render_ms": item.get("render_ms", ""),
                 "controller_ms": item.get("controller_ms", ""),
                 "iter_ms": item.get("iter_ms", ""),
+                "step_accepted": int(bool(item.get("step_accepted", False))),
                 "stop_reason": item.get("stop_reason", ""),
             })
 
@@ -290,15 +411,33 @@ def history_for_json(history):
                 item["next_T_world_cam"],
                 dtype=np.float32,
             ).tolist(),
+            "raw_velocity": np.asarray(
+                item.get("raw_velocity", item["velocity"]),
+                dtype=np.float32,
+            ).tolist(),
             "velocity": np.asarray(item["velocity"], dtype=np.float32).tolist(),
+            "step_accepted": bool(item.get("step_accepted", False)),
+            "velocity_limited": bool(item.get("velocity_limited", False)),
+            "velocity_scale": item.get("velocity_scale"),
+            "translation_step": item.get("translation_step"),
+            "rotation_step_deg": item.get("rotation_step_deg"),
+            "raw_translation_step": item.get("raw_translation_step"),
+            "raw_rotation_step_deg": item.get("raw_rotation_step_deg"),
+            "max_translation_step": item.get("max_translation_step"),
+            "max_rotation_step_deg": item.get("max_rotation_step_deg"),
+            "hard_translation_step": item.get("hard_translation_step"),
+            "hard_rotation_step_deg": item.get("hard_rotation_step_deg"),
             "num_matches": item.get("num_matches"),
             "num_inliers": item.get("num_inliers"),
             "feature_mode": item.get("feature_mode"),
-            "translation_error_m": item.get("translation_error_m"),
+            "translation_gap": item.get("translation_gap"),
+            "gap_closed_pct": item.get("gap_closed_pct"),
             "rotation_error_deg": item.get("rotation_error_deg"),
             "visualization_path": item.get("visualization_path"),
+            "diff_max": item.get("diff_max"),
+            "diff_mean": item.get("diff_mean"),
             "stop_reason": item.get("stop_reason"),
-            "controller_info": item.get("controller_info", {}),
+            "controller_info": public_controller_info(item.get("controller_info", {})),
         })
     return rows
 
@@ -359,8 +498,9 @@ TRIAL_INDEX_FIELDS = [
     "target_index",
     "iterations_run",
     "stop_reason",
-    "initial_translation_error_m",
-    "final_translation_error_m",
+    "initial_translation_gap",
+    "final_translation_gap",
+    "translation_gap_closed_pct",
     "initial_rotation_error_deg",
     "final_rotation_error_deg",
 ]
@@ -426,6 +566,13 @@ def experiment_config(
         "run_name": RUN_NAME,
         "stop_residual_px": float(STOP_RESIDUAL_PX),
         "stop_mse_per_px": float(STOP_MSE_PER_PX),
+        "stop_ssd": (None if STOP_SSD is None else float(STOP_SSD)),
+        "min_interaction_rank": int(MIN_INTERACTION_RANK),
+        "max_interaction_condition": (
+            None
+            if MAX_INTERACTION_CONDITION is None
+            else float(MAX_INTERACTION_CONDITION)
+        ),
         "controller_kind": CONTROLLER,
         "sigma_blur": float(SIGMA_BLUR),
         "use_gzn": bool(USE_GZN),
@@ -447,7 +594,7 @@ def run(args):
     from features import FeatureMatcher
     from photometric import PhotometricControllerTorch
     from servo import run_servo_loop
-    from viz import save_error_evolution
+    from viz import save_current_desired_error_visualization, save_error_evolution
 
     applied_config = load_cli_config(
         args.config,
@@ -483,6 +630,8 @@ def run(args):
             use_intrinsic_depth=DEPTH_MODE == "intrinsic",
             ratio=RATIO,
             stop_residual_px=STOP_RESIDUAL_PX,
+            min_interaction_rank=MIN_INTERACTION_RANK,
+            max_interaction_condition=MAX_INTERACTION_CONDITION,
         )
     elif CONTROLLER == "photometric":
         controller = PhotometricController(
@@ -497,6 +646,9 @@ def run(args):
             huber_k=HUBER_K,
             use_intrinsic_depth=DEPTH_MODE == "intrinsic",
             stop_mse_per_px=STOP_MSE_PER_PX,
+            stop_ssd=STOP_SSD,
+            min_interaction_rank=MIN_INTERACTION_RANK,
+            max_interaction_condition=MAX_INTERACTION_CONDITION,
         )
     elif CONTROLLER == "photometric_torch":
         controller = PhotometricControllerTorch(
@@ -512,6 +664,9 @@ def run(args):
             use_intrinsic_depth=DEPTH_MODE == "intrinsic",
             method="lm",
             stop_mse_per_px=STOP_MSE_PER_PX,
+            stop_ssd=STOP_SSD,
+            min_interaction_rank=MIN_INTERACTION_RANK,
+            max_interaction_condition=MAX_INTERACTION_CONDITION,
         )
     else:
         raise ValueError(f"Unknown CONTROLLER={CONTROLLER!r}")
@@ -536,12 +691,12 @@ def run(args):
     save_rgb(output_dir / "target.png", target_image)
     save_rgb(output_dir / "initial_render.png", initial_render)
 
-    initial_translation_error = translation_error_m(start_camera, target_camera)
+    initial_translation_gap = translation_gap(start_camera, target_camera)
     initial_rotation_error = rotation_error_deg(start_camera, target_camera)
     target_T_world_cam = target_camera.T_world_cam.copy()
 
     def record_iteration_metrics(item):
-        translation_error = translation_error_from_pose(
+        translation_gap = translation_error_from_pose(
             item["T_world_cam"],
             target_T_world_cam,
         )
@@ -549,21 +704,24 @@ def run(args):
             item["T_world_cam"],
             target_T_world_cam,
         )
-        item["translation_error_m"] = translation_error
+        item["translation_gap"] = translation_gap
         item["rotation_error_deg"] = rotation_error
+        closed_pct = gap_closed_percent(initial_translation_gap, translation_gap)
+        item["gap_closed_pct"] = closed_pct
 
         info = item.get("controller_info", {})
-        residual = info.get("residual_norm", float("nan"))
+        err_label, err_value = controller_error_display(info)
         inliers = info.get("num_inlier_matches", 0)
         print(
-            f"iter {item['iteration']:04d}: "
-            f"mode={info.get('feature_mode')} "
-            f"error_norm={residual:.6f} "
-            f"pose_distance={translation_error * 1000.0:.4f}mm "
-            f"rotation_distance={rotation_error:.4f}deg "
-            f"cached={info.get('num_cached_features', 0)} "
-            f"dropped={info.get('num_dropped_features', 0)} "
-            f"inliers={inliers}"
+            f"it={item['iteration']:04d} "
+            f"ok={int(bool(item.get('step_accepted', False)))} "
+            f"mode={info.get('feature_mode', '-')} "
+            f"{err_label}={err_value} "
+            f"t_gap={format_stat(translation_gap, 6)} "
+            f"rot_gap={format_stat(rotation_error, 3)}deg "
+            f"closed={format_percent(closed_pct)} "
+            f"inliers={inliers} "
+            f"stop={short_stop_reason(item.get('stop_reason'))}"
         )
 
     result = run_servo_loop(
@@ -583,6 +741,15 @@ def run(args):
     final_camera = result["camera"]
     final_render = result["rendered"]
     save_rgb(output_dir / "final_render.png", final_render)
+    final_photometric_viz = {}
+    if CONTROLLER in ("photometric", "photometric_torch"):
+        final_photometric_viz = save_current_desired_error_visualization(
+            final_render,
+            target_image,
+            visualizations_dir / "final_desired_error.png",
+            current_label="final",
+            desired_label="desired",
+        )
     write_history_csv(output_dir / "history.csv", result["history"])
     write_history_csv(logs_dir / "history.csv", result["history"])
     save_error_evolution(
@@ -594,7 +761,7 @@ def run(args):
         logs_dir / "error_evolution.png",
     )
 
-    final_translation_error = translation_error_m(final_camera, target_camera)
+    final_translation_gap = translation_gap(final_camera, target_camera)
     final_rotation_error = rotation_error_deg(final_camera, target_camera)
     summary = {
         "config": experiment_config(
@@ -631,8 +798,15 @@ def run(args):
         "start_T_world_cam": start_camera.T_world_cam.tolist(),
         "target_T_world_cam": target_camera.T_world_cam.tolist(),
         "final_T_world_cam": final_camera.T_world_cam.tolist(),
-        "initial_translation_error_m": initial_translation_error,
-        "final_translation_error_m": final_translation_error,
+        "final_desired_error_viz": final_photometric_viz.get(
+            "visualization_path",
+        ),
+        "initial_translation_gap": initial_translation_gap,
+        "final_translation_gap": final_translation_gap,
+        "translation_gap_closed_pct": gap_closed_percent(
+            initial_translation_gap,
+            final_translation_gap,
+        ),
         "initial_rotation_error_deg": initial_rotation_error,
         "final_rotation_error_deg": final_rotation_error,
         "iterations_run": len(result["history"]),
@@ -670,8 +844,12 @@ def run(args):
         "render_fps": float(result.get("timing", {}).get("render_fps", 0.0)),
         "iter_ms_mean": float(result.get("timing", {}).get("iter_ms_mean", 0.0)),
         "render_ms_mean": float(result.get("timing", {}).get("render_ms_mean", 0.0)),
-        "initial_translation_error_m": initial_translation_error,
-        "final_translation_error_m": final_translation_error,
+        "initial_translation_gap": initial_translation_gap,
+        "final_translation_gap": final_translation_gap,
+        "translation_gap_closed_pct": gap_closed_percent(
+            initial_translation_gap,
+            final_translation_gap,
+        ),
         "initial_rotation_error_deg": initial_rotation_error,
         "final_rotation_error_deg": final_rotation_error,
     })
@@ -691,12 +869,12 @@ def run(args):
         f"ctrl_ms={timing.get('controller_ms_mean', 0.0):.2f})"
     )
     print(
-        f"Translation error: {initial_translation_error * 1000.0:.4f}mm -> "
-        f"{final_translation_error * 1000.0:.4f}mm"
+        f"Translation gap: {format_stat(initial_translation_gap, 6)} -> "
+        f"{format_stat(final_translation_gap, 6)}"
     )
     print(
-        f"Rotation error: {initial_rotation_error:.4f}deg -> "
-        f"{final_rotation_error:.4f}deg"
+        f"Rotation gap: {format_stat(initial_rotation_error, 4)}deg -> "
+        f"{format_stat(final_rotation_error, 4)}deg"
     )
     if info:
         print(

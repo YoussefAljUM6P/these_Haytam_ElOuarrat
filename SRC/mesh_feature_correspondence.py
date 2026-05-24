@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from dataset import load_colmap, load_scannet
+from dataset import load_colmap
 from features import FeatureMatcher, filter_matches
 from scenes.mesh import MeshScene
 from viz import save_match_visualization
@@ -109,7 +109,7 @@ def parse_args():
         "--scene-dir",
         type=Path,
         default=PROJECT_ROOT / "DATA" / "kitchen",
-        help="ScanNet-style scene directory with info.txt and data/frame-*.color.jpg.",
+        help="COLMAP-style scene directory with sparse/0 and images/.",
     )
     parser.add_argument(
         "--mesh",
@@ -126,12 +126,9 @@ def parse_args():
     )
     parser.add_argument(
         "--camera-source",
-        choices=("auto", "scannet", "colmap"),
+        choices=("auto", "colmap"),
         default="auto",
-        help=(
-            "Pose/image source. Use colmap for COLMAP/Poisson meshes and scannet for "
-            "<scene-dir>/mesh.ply. auto chooses scannet only for the default mesh."
-        ),
+        help="Pose/image source. auto resolves to colmap."
     )
     parser.add_argument(
         "--method",
@@ -149,20 +146,12 @@ def parse_args():
 
 
 def resolve_camera_source(scene_dir, mesh_paths, requested):
-    if requested != "auto":
-        return requested
-
-    scene_mesh = (scene_dir / "mesh.ply").resolve()
-    resolved_meshes = [Path(mesh_path).resolve() for mesh_path in mesh_paths]
-    if resolved_meshes == [scene_mesh]:
-        return "scannet"
-    return "colmap"
+    if requested == "auto":
+        return "colmap"
+    return requested
 
 
 def load_frames(scene_dir, camera_source):
-    if camera_source == "scannet":
-        frames = load_scannet(scene_dir)
-        return [(camera, rgb_path) for camera, rgb_path, _ in frames]
     if camera_source == "colmap":
         return sorted(load_colmap(scene_dir), key=lambda item: str(item[1]))
     raise ValueError(f"Unknown camera source: {camera_source!r}")

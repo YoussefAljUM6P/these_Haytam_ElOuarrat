@@ -21,7 +21,11 @@ from camera import Camera
 
 
 from .feature import FeatureLuminance
-from .servo import PhotometricServo
+from .servo import (
+    DEFAULT_MAX_INTERACTION_CONDITION,
+    DEFAULT_MIN_INTERACTION_RANK,
+    PhotometricServo,
+)
 
 
 def _to_numpy(t: Union[torch.Tensor, NDArray[Any]]) -> NDArray[Any]:
@@ -61,6 +65,9 @@ class PhotometricControllerTorch:
         device: Optional[str] = None,
         seed: int = 0,
         stop_mse_per_px: float = 2.0e-6,
+        stop_ssd: Optional[float] = None,
+        min_interaction_rank: int = DEFAULT_MIN_INTERACTION_RANK,
+        max_interaction_condition: Optional[float] = DEFAULT_MAX_INTERACTION_CONDITION,
     ) -> None:
         if scene is None and depth_provider is None:
             raise ValueError(
@@ -81,11 +88,10 @@ class PhotometricControllerTorch:
         self.depth_provider = depth_provider
         self.seed = int(seed)
         self.device = torch.device(device) if device is not None else torch.device("cpu")
-        # Stop when mean(e^2) per pixel falls below this threshold (ViSP-style
-        # stop, expressed resolution-free on whatever intensity scale the
-        # feature uses; for [0,1] floats the ViSP equivalent of `SSD>10000` on
-        # [0,255] over 320x240 is ~2e-6).
+        # ViSP-style stop is SSD on the feature error vector. If stop_ssd is
+        # None, derive the SSD threshold from the legacy per-pixel MSE knob.
         self.stop_mse_per_px = float(stop_mse_per_px)
+        self.stop_ssd = None if stop_ssd is None else float(stop_ssd)
 
         self.servo = PhotometricServo(
             gain=gain,
@@ -94,6 +100,8 @@ class PhotometricControllerTorch:
             mu_init=mu_init,
             use_huber=use_huber,
             huber_k=huber_k,
+            min_interaction_rank=min_interaction_rank,
+            max_interaction_condition=max_interaction_condition,
         )
 
         self._feature = None
@@ -104,12 +112,21 @@ class PhotometricControllerTorch:
     # -- public API --------------------------------------------------------
 
     def should_stop(self) -> Optional[str]:
-        """ViSP-style stop: residual mean square per pixel <= threshold."""
-        mse = self.last_info.get("residual_mse_per_px")
-        if mse is None or not np.isfinite(float(mse)):
+        """ViSP-style stop: SSD of the feature error vector below threshold."""
+        fault_reason = self.last_info.get("fault_reason")
+        if fault_reason:
+            return str(fault_reason)
+        ssd = self.last_info.get("stop_ssd")
+        threshold = self.last_info.get("stop_ssd_threshold")
+        if (
+            ssd is None
+            or threshold is None
+            or not np.isfinite(float(ssd))
+            or not np.isfinite(float(threshold))
+        ):
             return None
-        if float(mse) <= self.stop_mse_per_px:
-            return "photometric_mse_below_threshold"
+        if float(ssd) <= float(threshold):
+            return "photometric_ssd_below_threshold"
         return None
 
     def set_target_camera(self, camera: Camera) -> None:
@@ -125,6 +142,7 @@ class PhotometricControllerTorch:
         feature = self._feature
         feature.build_from(rendered)
         e = feature.error()
+        raw_error = feature.raw_error()
         L = feature.interaction()
         velocity_t, solver_info = self.servo.solve(e, L)
         velocity = _to_numpy(velocity_t).astype(np.float32)
@@ -137,6 +155,17 @@ class PhotometricControllerTorch:
             max_d = float(depths.max().item())
         else:
             mean_d = min_d = max_d = float("nan")
+        raw_image_ssd = (
+            float(raw_error.pow(2).sum().item())
+            if raw_error.numel()
+            else float("nan")
+        )
+        raw_image_mse = (
+            float(raw_error.pow(2).mean().item())
+            if raw_error.numel()
+            else float("nan")
+        )
+        stop_ssd_threshold = self._stop_ssd_threshold(n_used)
 
         self.last_info = {
             "iteration": int(iteration),
@@ -146,13 +175,36 @@ class PhotometricControllerTorch:
             "num_inlier_matches": n_used,
             "num_cached_features": n_used,
             "num_dropped_features": int(feature.num_total_valid - n_used),
+            "measurement_valid": solver_info["measurement_valid"],
+            "fault_reason": solver_info["fault_reason"],
             "residual_norm": solver_info["residual_norm"],
             "residual_ssd": solver_info["residual_ssd"],
             "residual_mse_per_px": solver_info["residual_mse_per_px"],
+            "control_residual_norm": solver_info["control_residual_norm"],
+            "control_residual_ssd": solver_info["control_residual_ssd"],
+            "control_residual_mse_per_px": solver_info["control_residual_mse_per_px"],
+            "weighted_residual_norm": solver_info["weighted_residual_norm"],
+            "weighted_residual_ssd": solver_info["weighted_residual_ssd"],
+            "weighted_residual_mse_per_px": solver_info["weighted_residual_mse_per_px"],
+            "raw_image_ssd": raw_image_ssd,
+            "raw_image_mse_per_px": raw_image_mse,
+            "stop_ssd": solver_info["control_residual_ssd"],
+            "stop_ssd_threshold": stop_ssd_threshold,
+            "stop_mse_per_px_threshold": self.stop_mse_per_px,
+            "interaction_rows": solver_info["interaction_rows"],
+            "interaction_cols": solver_info["interaction_cols"],
+            "interaction_rank": solver_info["interaction_rank"],
+            "interaction_min_rank": solver_info["interaction_min_rank"],
+            "interaction_condition": solver_info["interaction_condition"],
+            "interaction_max_condition": solver_info["interaction_max_condition"],
+            "interaction_min_singular": solver_info["interaction_min_singular"],
+            "interaction_max_singular": solver_info["interaction_max_singular"],
+            "interaction_rank_tolerance": solver_info["interaction_rank_tolerance"],
+            "interaction_svd_failed": solver_info["interaction_svd_failed"],
             "velocity_norm": float(np.linalg.norm(velocity)),
-            "mean_depth_m": mean_d,
-            "min_depth_m": min_d,
-            "max_depth_m": max_d,
+            "mean_depth": mean_d,
+            "min_depth": min_d,
+            "max_depth": max_d,
             "num_pixels_used": n_used,
             "use_gzn": self.use_gzn,
             "huber_k_active": solver_info["huber_k"],
@@ -166,10 +218,18 @@ class PhotometricControllerTorch:
             "feature_mode": "photometric",
             "num_pixels_used": n_used,
             "residual_norm": solver_info["residual_norm"],
+            "residual_ssd": solver_info["residual_ssd"],
         }
         return velocity
 
     # -- internals ---------------------------------------------------------
+
+    def _stop_ssd_threshold(self, num_pixels: int) -> float:
+        if self.stop_ssd is not None:
+            return float(self.stop_ssd)
+        if int(num_pixels) <= 0:
+            return float("nan")
+        return float(self.stop_mse_per_px) * float(num_pixels)
 
     def _build_feature(self, target: NDArray[np.float32]) -> None:
         if self.target_camera is None:

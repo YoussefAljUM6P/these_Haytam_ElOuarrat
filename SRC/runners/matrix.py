@@ -414,10 +414,10 @@ def load_condition_metrics(condition_dir, run_root, dataset):
         return {}, str(scene_summary["error"])
 
     metrics = scene_summary.get("metrics", {})
-    ape_translation = metrics.get("ape_translation_m")
+    ape_translation = metrics.get("ape_translation")
     ape_rotation = metrics.get("ape_rotation_deg")
     if not isinstance(ape_translation, dict):
-        return {}, "ape_translation_m metrics not found"
+        return {}, "ape_translation metrics not found"
 
     return {
         "translation": ape_translation,
@@ -431,14 +431,12 @@ def metric_value(metrics, family, key):
     if value is None:
         return None
     value = float(value)
-    if family == "translation":
-        return value * 1000.0
     return value
 
 
 def metric_unit(family):
     if family == "translation":
-        return "mm"
+        return "scene scale"
     if family == "rotation":
         return "deg"
     raise ValueError(f"Unknown metric family {family!r}")
@@ -455,6 +453,20 @@ def metric_title(family):
 def format_metric(value):
     if value is None:
         return "X"
+    value = float(value)
+    if value != value:
+        return "-"
+    if value in (float("inf"), float("-inf")):
+        return "inf" if value > 0.0 else "-inf"
+    mag = abs(value)
+    if mag == 0.0:
+        return "0"
+    if mag < 1.0e-3:
+        return f"{value:.2e}"
+    if mag < 1.0:
+        return f"{value:.6f}".rstrip("0").rstrip(".")
+    if mag < 10.0:
+        return f"{value:.4f}".rstrip("0").rstrip(".")
     return f"{value:.2f}"
 
 
@@ -468,7 +480,7 @@ def write_condition_metrics_txt(path, condition, metrics, error):
     if error:
         lines.append(f"ERROR: {error}")
     else:
-        lines.append("APE translation (mm)")
+        lines.append("APE translation")
         for key in METRIC_KEYS:
             lines.append(
                 f"{METRIC_LABELS[key]}: "
@@ -503,9 +515,9 @@ def write_batch_outputs(batch_dir, results):
         ],
     )
     write_long_csv(batch_dir / "conditions_ape_metrics.csv", results)
-    write_matrix_csv(batch_dir / "matrix_ape_translation_mm.csv", results, "translation")
+    write_matrix_csv(batch_dir / "matrix_ape_translation_gap.csv", results, "translation")
     write_matrix_markdown(
-        batch_dir / "matrix_ape_translation_mm.md",
+        batch_dir / "matrix_ape_translation_gap.md",
         results,
         "translation",
     )
@@ -531,11 +543,11 @@ def write_long_csv(path, results):
         "depth",
         "matcher",
         "status",
-        "ape_translation_rmse_mm",
-        "ape_translation_mean_mm",
-        "ape_translation_median_mm",
-        "ape_translation_std_mm",
-        "ape_translation_max_mm",
+        "ape_translation_rmse",
+        "ape_translation_mean",
+        "ape_translation_median",
+        "ape_translation_std",
+        "ape_translation_max",
         "ape_rotation_rmse_deg",
         "ape_rotation_mean_deg",
         "ape_rotation_median_deg",
@@ -563,7 +575,7 @@ def write_long_csv(path, results):
             for key in METRIC_KEYS:
                 t_value = None if error else metric_value(metrics, "translation", key)
                 r_value = None if error else metric_value(metrics, "rotation", key)
-                row[f"ape_translation_{key}_mm"] = (
+                row[f"ape_translation_{key}"] = (
                     "" if t_value is None else f"{t_value:.6f}"
                 )
                 row[f"ape_rotation_{key}_deg"] = (
@@ -642,7 +654,7 @@ def run(args):
             metrics = result["metrics"]
             print(
                 "  ok: "
-                f"trans_rmse={format_metric(metric_value(metrics, 'translation', 'rmse'))}mm "
+                f"trans_rmse={format_metric(metric_value(metrics, 'translation', 'rmse'))} "
                 f"rot_rmse={format_metric(metric_value(metrics, 'rotation', 'rmse'))}deg"
             )
         else:
@@ -654,5 +666,5 @@ def run(args):
 
     write_batch_outputs(batch_dir, results)
     print(f"\nWrote batch outputs to {batch_dir}")
-    print(f"Translation matrix: {batch_dir / 'matrix_ape_translation_mm.md'}")
+    print(f"Translation matrix: {batch_dir / 'matrix_ape_translation_gap.md'}")
     print(f"Rotation matrix: {batch_dir / 'matrix_ape_rotation_deg.md'}")

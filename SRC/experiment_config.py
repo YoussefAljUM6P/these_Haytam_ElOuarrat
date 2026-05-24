@@ -14,6 +14,7 @@ _PHOTOMETRIC_KEYS = {
     "use_gzn": "USE_GZN",
     "grad_percentile": "GRAD_PERCENTILE",
     "photometric_max_pixels": "PHOTOMETRIC_MAX_PIXELS",
+    "stop_ssd": "STOP_SSD",
     "use_huber": "USE_HUBER",
     "huber_k": "HUBER_K",
 }
@@ -35,6 +36,8 @@ TRAJECTORY_CONFIG_KEYS = {
     "max_pairs": "MAX_PAIRS",
     "stop_residual_px": "STOP_RESIDUAL_PX",
     "stop_mse_per_px": "STOP_MSE_PER_PX",
+    "min_interaction_rank": "MIN_INTERACTION_RANK",
+    "max_interaction_condition": "MAX_INTERACTION_CONDITION",
     "dynamic_ibvs_iters": "DYNAMIC_IBVS_ITERS",
     "rpe_delta": "RPE_DELTA",
     "run_tag": "RUN_TAG",
@@ -61,6 +64,8 @@ SERVO_FRAMES_CONFIG_KEYS = {
     "run_name": "RUN_NAME",
     "stop_residual_px": "STOP_RESIDUAL_PX",
     "stop_mse_per_px": "STOP_MSE_PER_PX",
+    "min_interaction_rank": "MIN_INTERACTION_RANK",
+    "max_interaction_condition": "MAX_INTERACTION_CONDITION",
     **_PHOTOMETRIC_KEYS,
 }
 
@@ -111,12 +116,14 @@ INT_KEYS = {
     "iterations",
     "min_features",
     "ratio",
+    "n1",
     "start_index",
     "index_away",
     "viz_iter",
     "rpe_delta",
     "task_viz_every",
     "photometric_max_pixels",
+    "min_interaction_rank",
 }
 OPTIONAL_INT_KEYS = {"max_pairs", "target_index"}
 FLOAT_KEYS = {
@@ -129,7 +136,7 @@ FLOAT_KEYS = {
     "sigma_blur",
     "grad_percentile",
 }
-OPTIONAL_FLOAT_KEYS = {"huber_k"}
+OPTIONAL_FLOAT_KEYS = {"huber_k", "stop_ssd", "max_interaction_condition"}
 BOOL_KEYS = {"save_task_viz", "use_gzn", "use_huber", "dynamic_ibvs_iters"}
 OPTIONAL_STR_KEYS = {"run_tag", "run_name"}
 
@@ -252,7 +259,10 @@ def coerce_config_value(key, value):
     if key in OPTIONAL_FLOAT_KEYS:
         if is_null_value(value):
             return None
-        return float(value)
+        value = float(value)
+        if key == "max_interaction_condition" and value <= 0.0:
+            raise ValueError("max_interaction_condition must be > 0 or null")
+        return value
     if key in BOOL_KEYS:
         return coerce_bool(value)
     if key == "controller":
@@ -323,11 +333,15 @@ def is_null_value(value):
 def validate_int_value(key, value):
     if key in {"start_index", "min_features", "stride", "rpe_delta"} and value < 1:
         raise ValueError(f"{key} must be >= 1")
+    if key == "min_interaction_rank" and not (1 <= value <= 6):
+        raise ValueError("min_interaction_rank must be in [1, 6]")
     if key in {
         "mini_iterations",
         "iterations",
         "ratio",
-        "viz_iter",
+        "dynamic_scheduling",
+        "n1",
+        "dt",
         "task_viz_every",
         "photometric_max_pixels",
     } and value < 0:

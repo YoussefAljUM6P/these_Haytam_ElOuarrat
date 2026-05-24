@@ -2,51 +2,14 @@ import numpy as np
 from pathlib import Path
 from camera import Camera
 
-def load_scannet(scene_dir):
-    scene_dir = Path(scene_dir)
-    info_path = scene_dir / "info.txt"
-
-    fx = fy = cx = cy = 0.0
-    W = H = 0
-
-    with open(info_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("m_colorWidth"):
-                W = int(line.split("=")[1].strip())
-            elif line.startswith("m_colorHeight"):
-                H = int(line.split("=")[1].strip())
-            elif line.startswith("m_calibrationColorIntrinsic"):
-                vals = [float(v) for v in line.split("=")[1].strip().split()]
-                intrinsics = np.array(vals).reshape(4, 4)
-                fx = intrinsics[0, 0]
-                fy = intrinsics[1, 1]
-                cx = intrinsics[0, 2]
-                cy = intrinsics[1, 2]
-
-    pose_files = sorted(list((scene_dir / "data").glob("frame-*.pose.txt")))
-
-    data = []
-    for pose_file in pose_files:
-        T_world_cam = np.loadtxt(pose_file, dtype=np.float32)
-        # ScanNet emits non-finite poses for tracking failures; skip them.
-        if not np.isfinite(T_world_cam).all():
-            continue
-        stem = pose_file.name.split(".pose.txt")[0]
-        rgb_path = scene_dir / "data" / f"{stem}.color.jpg"
-        depth_path = scene_dir / "data" / f"{stem}.depth.png"
-
-        cam = Camera(T_world_cam, fx, fy, cx, cy, H, W)
-        data.append((cam, rgb_path, depth_path))
-
-    return data
-
 def load_colmap(scene_dir):
     import pycolmap
+    import sys
     scene_dir = Path(scene_dir)
     reconstruction = pycolmap.Reconstruction(scene_dir / "sparse" / "0")
 
     data = []
+    skipped = []
     for _, image in reconstruction.images.items():
         camera = reconstruction.cameras[image.camera_id]
 
@@ -80,8 +43,19 @@ def load_colmap(scene_dir):
 
         # COLMAP image names are relative to the reconstruction's images/ dir.
         rgb_path = scene_dir / "images" / image.name
+        if not rgb_path.is_file():
+            skipped.append(image.name)
+            continue
 
         cam = Camera(T_world_cam, fx, fy, cx, cy, H, W)
         data.append((cam, rgb_path))
 
+    if skipped:
+        preview = ", ".join(skipped[:5])
+        more = f" (+{len(skipped) - 5} more)" if len(skipped) > 5 else ""
+        print(
+            f"[load_colmap] skipped {len(skipped)} registered image(s) with "
+            f"missing files under {scene_dir / 'images'}: {preview}{more}",
+            file=sys.stderr,
+        )
     return data

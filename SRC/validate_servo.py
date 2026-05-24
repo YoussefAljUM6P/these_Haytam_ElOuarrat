@@ -127,6 +127,25 @@ def main():
             raise AssertionError(f"Missing iteration visualization: {path}")
     if result["history"][0]["num_matches"] != 4:
         raise AssertionError("Servo loop did not record feature correspondence counts")
+    history_keys = set(result["history"][0])
+    required_motion_keys = {
+        "translation_step",
+        "raw_translation_step",
+        "max_translation_step",
+        "hard_translation_step",
+    }
+    missing_motion_keys = required_motion_keys - history_keys
+    if missing_motion_keys:
+        raise AssertionError(f"Servo history missing motion keys: {missing_motion_keys}")
+    old_suffix = "_" + "m"
+    old_motion_keys = {
+        "translation_step" + old_suffix,
+        "raw_translation_step" + old_suffix,
+        "max_translation_step" + old_suffix,
+        "hard_translation_step" + old_suffix,
+    } & history_keys
+    if old_motion_keys:
+        raise AssertionError(f"Servo history kept old meter-suffix keys: {old_motion_keys}")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         run_servo_loop(

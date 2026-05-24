@@ -153,7 +153,7 @@ def render_missing_scene_visuals(
         load_scene_and_frames,
     )
     from servo import copy_camera_with_pose
-    from viz import save_side_by_side
+    from viz import save_current_desired_error_visualization, save_side_by_side
 
     scene_dir = Path(scene_dir)
     summary_path = scene_dir / "summary.json"
@@ -169,6 +169,7 @@ def render_missing_scene_visuals(
 
     scene_name = summary.get("scene", scene_dir.name)
     renderer = summary.get("renderer")
+    controller = summary.get("controller")
     if not renderer:
         raise RuntimeError(f"Cannot render missing visuals: {summary_path} has no renderer")
 
@@ -211,7 +212,16 @@ def render_missing_scene_visuals(
             task_index=task_index,
             target_frame=target_frame,
         )
-        save_side_by_side(rendered, target_image, out_path)
+        if controller in ("photometric", "photometric_torch"):
+            save_current_desired_error_visualization(
+                rendered,
+                target_image,
+                out_path,
+                current_label="final",
+                desired_label="desired",
+            )
+        else:
+            save_side_by_side(rendered, target_image, out_path)
         frame_paths.append(out_path)
 
     return frame_paths
