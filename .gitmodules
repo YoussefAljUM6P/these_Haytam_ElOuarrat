@@ -1,3 +1,6 @@
+[submodule "SRC/third_party/MoGe"]
+	path = SRC/third_party/MoGe
+	url = https://github.com/microsoft/MoGe.git
 [submodule "SRC/third_party/accelerated_features"]
 	path = SRC/third_party/accelerated_features
 	url = https://github.com/verlab/accelerated_features.git

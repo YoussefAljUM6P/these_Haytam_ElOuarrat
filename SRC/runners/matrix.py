@@ -3,7 +3,7 @@
 Launches `python cli.py trajectory ...` once per condition:
 
     scene/render source in {GS, Poisson Mesh}
-    depth in {Intrinsic}
+    depth in {Intrinsic, MoGe2}
     matcher in {SIFT, XFeat}
 
 Each condition gets a directory under ``RUNS/servo_matrix/<batch_id>/`` with:
@@ -81,6 +81,7 @@ SCENES = (
 
 DEPTHS = (
     DepthSpec("Intrinsic", "intrinsic"),
+    DepthSpec("MoGe2", "learned"),
 )
 
 MATCHERS = (

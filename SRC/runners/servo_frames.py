@@ -32,7 +32,7 @@ INDEX_AWAY = 1
 TARGET_INDEX = None
 ITERATIONS = 100
 DT = 1.0
-DEPTH_MODE = "intrinsic"  # "intrinsic" = scene.render_depth()
+DEPTH_MODE = "intrinsic"  # "learned" = MoGe2, "intrinsic" = scene.render_depth()
 FEATURE_METHOD = "sift"
 VIZ_ITER = 1
 GAIN_IBVS = 0.75
@@ -716,8 +716,8 @@ def run(args):
     if applied_config:
         print(f"Applied servo config: {format_applied_config(applied_config)}")
 
-    if DEPTH_MODE != "intrinsic":
-        raise ValueError("DEPTH_MODE must be 'intrinsic'")
+    if DEPTH_MODE not in ("learned", "intrinsic"):
+        raise ValueError("DEPTH_MODE must be 'learned' or 'intrinsic'")
 
     scene, frame_index = load_scene_and_frames(SCENE_DIR, RENDERER)
     start_index = int(START_INDEX)

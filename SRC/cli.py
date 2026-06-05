@@ -121,7 +121,7 @@ CONTROLLERS = {
     "photometric_torch": "PVS  (photometric, PyTorch / ViSP port)",
 }
 
-DEPTH_MODES = ["intrinsic"]
+DEPTH_MODES = ["intrinsic", "learned"]
 FEATURE_METHODS = ["sift", "xfeat"]
 
 
@@ -374,6 +374,7 @@ def wizard():
                 "Depth mode:",
                 [
                     Choice("intrinsic  — scene.render_depth()", value="intrinsic"),
+                    Choice("learned    — MoGe2", value="learned"),
                 ],
                 default="intrinsic",
             ),
