@@ -13,18 +13,25 @@ Use via the CLI:
 import csv
 import json
 import traceback
-from datetime import datetime
 from pathlib import Path
 
+from run_layout import (
+    unique_run_root,
+    write_command,
+    write_json as write_run_json,
+    write_run_readme,
+)
 from runners.servo_frames import (
     PROJECT_ROOT,
     RUNS_ROOT,
     camera_metadata,
     controller_error_display,
+    depth_preflight,
     format_percent,
     format_stat,
     gap_closed_percent,
     frame_id_from_path,
+    needs_intrinsic_depth_preflight,
     load_rgb,
     rotation_error_from_pose,
     short_stop_reason,
@@ -393,6 +400,8 @@ PER_TASK_FIELDS = [
     "final_residual",
     "diverged",
     "stop_reason",
+    "depth_valid_pixels",
+    "depth_finite_ratio",
     "initial_translation_gap",
     "translation_gap",
     "gap_closed_pct",
@@ -453,20 +462,209 @@ def read_tum(path):
     return timestamps, poses
 
 
-def find_latest_resumable_run(renderer, tag):
-    base = RUNS_ROOT / "trajectory" / renderer
-    if not base.exists():
+def _format_summary_value(value):
+    if value is None:
+        return "-"
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if value != value:
+        return "-"
+    if value in (float("inf"), float("-inf")):
+        return "inf" if value > 0.0 else "-inf"
+    mag = abs(value)
+    if mag == 0.0:
+        return "0"
+    if mag < 1.0e-3:
+        return f"{value:.2e}"
+    if mag < 1.0:
+        return f"{value:.6f}".rstrip("0").rstrip(".")
+    if mag < 10.0:
+        return f"{value:.4f}".rstrip("0").rstrip(".")
+    return f"{value:.2f}"
+
+
+def _summary_metric(scene_summary, family, key):
+    if not isinstance(scene_summary, dict):
         return None
-    candidates = []
+    metrics = scene_summary.get("metrics", {})
+    if not isinstance(metrics, dict):
+        return None
+    values = metrics.get(family, {})
+    if not isinstance(values, dict):
+        return None
+    return values.get(key)
+
+
+def _summary_status(scene_summary):
+    if not isinstance(scene_summary, dict):
+        return "failed"
+    if "error" in scene_summary and "metrics" not in scene_summary:
+        return "failed"
+    metrics = scene_summary.get("metrics", {})
+    if isinstance(metrics, dict) and metrics.get("error"):
+        return "eval_failed"
+    return "ok"
+
+
+def _summary_error(scene_summary):
+    if not isinstance(scene_summary, dict):
+        return "invalid summary"
+    if "error" in scene_summary and "metrics" not in scene_summary:
+        return str(scene_summary["error"])
+    metrics = scene_summary.get("metrics", {})
+    if isinstance(metrics, dict) and metrics.get("error"):
+        return str(metrics["error"])
+    return ""
+
+
+def write_trajectory_summary_markdown(path, overall):
+    rows = [[
+        "Dataset",
+        "Status",
+        "Tasks",
+        "APE trans RMSE",
+        "APE trans mean",
+        "APE rot RMSE deg",
+        "RPE trans RMSE",
+        "RPE rot RMSE deg",
+        "Error",
+    ]]
+    for scene_name, scene_summary in overall.items():
+        rows.append([
+            scene_name,
+            _summary_status(scene_summary),
+            (
+                str(scene_summary.get("num_tasks", "-"))
+                if isinstance(scene_summary, dict)
+                else "-"
+            ),
+            _format_summary_value(
+                _summary_metric(scene_summary, "ape_translation", "rmse")
+            ),
+            _format_summary_value(
+                _summary_metric(scene_summary, "ape_translation", "mean")
+            ),
+            _format_summary_value(
+                _summary_metric(scene_summary, "ape_rotation_deg", "rmse")
+            ),
+            _format_summary_value(
+                _summary_metric(scene_summary, "rpe_translation", "rmse")
+            ),
+            _format_summary_value(
+                _summary_metric(scene_summary, "rpe_rotation_deg", "rmse")
+            ),
+            _summary_error(scene_summary),
+        ])
+
+    widths = [max(len(str(row[i])) for row in rows) for i in range(len(rows[0]))]
+
+    def fmt(row):
+        return "| " + " | ".join(
+            str(cell).ljust(widths[i]) for i, cell in enumerate(row)
+        ) + " |"
+
+    lines = [
+        "# Trajectory Comparative Summary",
+        "",
+        "Translation values are in COLMAP scene scale.",
+        "",
+        fmt(rows[0]),
+        "| " + " | ".join("-" * width for width in widths) + " |",
+    ]
+    lines.extend(fmt(row) for row in rows[1:])
+    lines.append("")
+    Path(path).write_text("\n".join(lines))
+
+
+def trajectory_scene_dir(run_root, scene_name, resume=False):
+    run_root = Path(run_root)
+    new_dir = run_root / "scenes" / scene_name
+    old_dir = run_root / scene_name
+    if resume and old_dir.exists() and not new_dir.exists():
+        return old_dir
+    return new_dir
+
+
+def trajectory_run_parts(tag):
+    dataset_part = DATASETS[0] if len(DATASETS) == 1 else f"all{len(DATASETS)}"
+    method = FEATURE_METHOD if CONTROLLER == "ibvs" else CONTROLLER
+    return [dataset_part, RENDERER, CONTROLLER, DEPTH_MODE, method, tag]
+
+
+def resolved_trajectory_config(tag, run_root):
+    return {
+        "kind": "trajectory",
+        "run_root": str(run_root),
+        "run_tag": tag,
+        "datasets": list(DATASETS),
+        "renderer": RENDERER,
+        "nerf_render_scale": float(NERF_RENDER_SCALE),
+        "stride": int(STRIDE),
+        "mini_iterations": int(MINI_ITERATIONS),
+        "dt": float(DT),
+        "depth_mode": DEPTH_MODE,
+        "feature_method": FEATURE_METHOD,
+        "controller": CONTROLLER,
+        "gain_ibvs": float(GAIN_IBVS),
+        "gain_photo": float(GAIN_PHOTO),
+        "min_features": int(MIN_FEATURES),
+        "ratio": int(RATIO),
+        "start_index": int(START_INDEX),
+        "max_pairs": MAX_PAIRS,
+        "stop_residual_px": float(STOP_RESIDUAL_PX),
+        "stop_mse_per_px": float(STOP_MSE_PER_PX),
+        "stop_ssd": None if STOP_SSD is None else float(STOP_SSD),
+        "min_interaction_rank": int(MIN_INTERACTION_RANK),
+        "max_interaction_condition": (
+            None
+            if MAX_INTERACTION_CONDITION is None
+            else float(MAX_INTERACTION_CONDITION)
+        ),
+        "rpe_delta": int(RPE_DELTA),
+        "save_task_viz": bool(SAVE_TASK_VIZ),
+        "task_viz_every": int(TASK_VIZ_EVERY),
+        "dynamic_ibvs_iters": bool(DYNAMIC_IBVS_ITERS),
+        "sigma_blur": float(SIGMA_BLUR),
+        "use_gzn": bool(USE_GZN),
+        "grad_percentile": float(GRAD_PERCENTILE),
+        "photometric_max_pixels": int(PHOTOMETRIC_MAX_PIXELS),
+        "use_huber": bool(USE_HUBER),
+        "huber_k": None if HUBER_K is None else float(HUBER_K),
+    }
+
+
+def _trajectory_has_progress(run_root):
+    return any(
+        (trajectory_scene_dir(run_root, scene_name) / "per_task_errors.csv").exists()
+        or (trajectory_scene_dir(run_root, scene_name, resume=True) / "per_task_errors.csv").exists()
+        for scene_name in DATASETS
+    )
+
+
+def _iter_trajectory_run_roots(renderer):
+    base = RUNS_ROOT / "trajectory"
+    if not base.exists():
+        return []
+
+    roots = []
     for entry in base.iterdir():
         if not entry.is_dir():
             continue
-        if not entry.name.endswith(f"_{tag}"):
+        if entry.name == renderer:
+            roots.extend(path for path in entry.iterdir() if path.is_dir())
+        elif entry.name not in {"mesh", "gs", "nerf"}:
+            roots.append(entry)
+    return roots
+
+
+def find_latest_resumable_run(renderer, tag):
+    candidates = []
+    for entry in _iter_trajectory_run_roots(renderer):
+        if f"_{tag}" not in entry.name:
             continue
-        has_progress = any(
-            (entry / s / "per_task_errors.csv").exists() for s in DATASETS
-        )
-        if has_progress:
+        if _trajectory_has_progress(entry):
             candidates.append(entry)
     if not candidates:
         return None
@@ -575,7 +773,7 @@ def run_scene(scene_name, run_root, resume=False):
     else:
         raise ValueError(f"Unknown CONTROLLER={CONTROLLER!r}")
 
-    scene_out = Path(run_root) / scene_name
+    scene_out = trajectory_scene_dir(run_root, scene_name, resume=resume)
     scene_out.mkdir(parents=True, exist_ok=True)
     viz_dir = scene_out / "visualizations" if SAVE_TASK_VIZ else None
     if viz_dir is not None:
@@ -667,7 +865,16 @@ def run_scene(scene_name, run_root, resume=False):
                 dynamic_w = feature_err_px / baseline_feature_err_px
             iters_for_task = _dynamic_n_iter(dynamic_w, MINI_ITERATIONS)
 
+        depth_preflight_info = None
         try:
+            if needs_intrinsic_depth_preflight(CONTROLLER, DEPTH_MODE):
+                depth_preflight_info = depth_preflight(
+                    scene,
+                    target_camera,
+                    renderer=RENDERER,
+                    frame_id=tgt_frame_id,
+                )
+
             result = run_servo_loop(
                 scene,
                 current_camera,
@@ -749,6 +956,14 @@ def run_scene(scene_name, run_root, resume=False):
             "dynamic_w": float(dynamic_w),
             "feature_err_px": float(feature_err_px),
             "stop_reason": result["stop_reason"],
+            "depth_valid_pixels": (
+                "" if depth_preflight_info is None
+                else int(depth_preflight_info["valid_pixels"])
+            ),
+            "depth_finite_ratio": (
+                "" if depth_preflight_info is None
+                else float(depth_preflight_info["finite_ratio"])
+            ),
             "initial_translation_gap": float(initial_translation_gap),
             "translation_gap": float(translation_err),
             "gap_closed_pct": float(closed_pct),
@@ -895,7 +1110,7 @@ def run(args):
             if run_root is None:
                 print(
                     f"--resume: no resumable run found under "
-                    f"RUNS/trajectory/{RENDERER}/ matching tag '{tag}'. "
+                    f"RUNS/trajectory/ matching tag '{tag}'. "
                     f"Starting a fresh run."
                 )
                 resume = False
@@ -908,19 +1123,56 @@ def run(args):
             print(f"Resuming run: {run_root}")
 
     if not resume:
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        run_root = RUNS_ROOT / "trajectory" / RENDERER / f"{timestamp}_{tag}"
+        run_root = unique_run_root(
+            RUNS_ROOT,
+            "trajectory",
+            trajectory_run_parts(tag),
+        )
 
     run_root.mkdir(parents=True, exist_ok=True)
 
     overall = {}
+    multi_dataset = len(DATASETS) > 1
     for scene_name in DATASETS:
         try:
             overall[scene_name] = run_scene(scene_name, run_root, resume=resume)
+        except SystemExit as e:
+            if not multi_dataset:
+                raise
+            traceback.print_exc()
+            overall[scene_name] = {"error": f"SystemExit({e.code})"}
         except Exception as e:
             traceback.print_exc()
             overall[scene_name] = {"error": str(e)}
 
-    with open(run_root / "trajectory_summary.json", "w") as f:
-        json.dump(overall, f, indent=2)
+    write_run_json(run_root / "trajectory_summary.json", overall)
+    write_run_json(run_root / "summary.json", overall)
+    write_run_json(
+        run_root / "config.resolved.json",
+        resolved_trajectory_config(tag, run_root),
+    )
+    write_command(run_root / "command.txt")
+
+    summary_md = run_root / "summary.md"
+    write_trajectory_summary_markdown(summary_md, overall)
+    write_trajectory_summary_markdown(run_root / "trajectory_summary.md", overall)
+    write_run_readme(
+        run_root / "README.md",
+        "SERVIS Trajectory Run",
+        fields=[
+            ("datasets", ", ".join(DATASETS)),
+            ("renderer", RENDERER),
+            ("controller", CONTROLLER),
+            ("depth", DEPTH_MODE),
+            ("feature", FEATURE_METHOD),
+            ("tag", tag),
+        ],
+        artifacts=[
+            ("summary table", "summary.md"),
+            ("machine summary", "summary.json"),
+            ("resolved config", "config.resolved.json"),
+            ("scene outputs", "scenes/<dataset>/"),
+        ],
+    )
     print(f"\nWrote {run_root}")
+    print(f"Summary table: {summary_md}")

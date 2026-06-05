@@ -3,13 +3,84 @@ import os
 import math
 import numpy as np
 import torch
-import plyfile
 
 # Ensure diff-gaussian-rasterization is importable
 third_party_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'third_party'))
 sys.path.append(third_party_dir)
 
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+
+
+# PLY scalar type -> numpy type code (binary formats only).
+_PLY_TYPE_MAP = {
+    'float': 'f4', 'float32': 'f4',
+    'double': 'f8', 'float64': 'f8',
+    'char': 'i1', 'int8': 'i1', 'uchar': 'u1', 'uint8': 'u1',
+    'short': 'i2', 'int16': 'i2', 'ushort': 'u2', 'uint16': 'u2',
+    'int': 'i4', 'int32': 'i4', 'uint': 'u4', 'uint32': 'u4',
+}
+
+
+def _memmap_ply_vertices(ply_path):
+    """Parse a binary PLY header and memory-map its vertex block.
+
+    Returns a read-only structured ``np.memmap`` over the vertex element. The
+    file is never copied into RAM wholesale: individual property columns page
+    in lazily from disk (reclaimable page cache) as they are read, so loading a
+    mult-GB splat does not balloon resident memory.
+    """
+    with open(ply_path, 'rb') as f:
+        if f.readline().strip() != b'ply':
+            raise ValueError(f"{ply_path}: not a PLY file")
+        fmt = f.readline().split()
+        if len(fmt) < 2 or fmt[0] != b'format':
+            raise ValueError(f"{ply_path}: malformed PLY format line")
+        byte_order = {b'binary_little_endian': '<', b'binary_big_endian': '>'}.get(fmt[1])
+        if byte_order is None:
+            raise ValueError(
+                f"{ply_path}: only binary PLY is supported, got {fmt[1].decode()!r}"
+            )
+
+        count = None
+        props = []
+        in_vertex = False
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError(f"{ply_path}: unexpected EOF in PLY header")
+            parts = line.split()
+            if not parts:
+                continue
+            kw = parts[0]
+            if kw == b'comment' or kw == b'obj_info':
+                continue
+            if kw == b'element':
+                in_vertex = parts[1] == b'vertex'
+                if in_vertex:
+                    count = int(parts[2])
+            elif kw == b'property' and in_vertex:
+                if parts[1] == b'list':
+                    raise ValueError(f"{ply_path}: list properties unsupported in vertex")
+                ply_type = parts[1].decode()
+                if ply_type not in _PLY_TYPE_MAP:
+                    raise ValueError(f"{ply_path}: unsupported property type {ply_type!r}")
+                props.append((parts[2].decode(), byte_order + _PLY_TYPE_MAP[ply_type]))
+            elif kw == b'end_header':
+                break
+        if count is None:
+            raise ValueError(f"{ply_path}: no 'vertex' element in header")
+        data_offset = f.tell()
+
+    dtype = np.dtype(props)
+    return np.memmap(ply_path, dtype=dtype, mode='r', offset=data_offset, shape=(count,))
+
+
+def _stack_columns(vertices, names):
+    """Copy the named memmap columns into one contiguous (N, len(names)) f32 array."""
+    out = np.empty((vertices.shape[0], len(names)), dtype=np.float32)
+    for i, name in enumerate(names):
+        out[:, i] = vertices[name]
+    return out
 
 
 def getProjectionMatrix(znear, zfar, fx, fy, cx, cy, W, H):
@@ -43,10 +114,13 @@ def getProjectionMatrix(znear, zfar, fx, fy, cx, cy, W, H):
 
 class GSScene:
     def __init__(self, ply_path):
-        plydata = plyfile.PlyData.read(ply_path)
-        v = plydata['vertex']
+        # Memory-mapped vertex block: columns stream from disk on demand so a
+        # multi-GB splat never lands in RAM all at once. Each attribute is then
+        # copied once into a contiguous host buffer, moved to the GPU, and freed
+        # before the next, keeping the host peak to roughly a single column block.
+        v = _memmap_ply_vertices(ply_path)
 
-        prop_names = {p.name for p in v.properties}
+        prop_names = {name for name in v.dtype.names}
         f_rest_count = sum(1 for n in prop_names if n.startswith('f_rest_'))
         if f_rest_count % 3 != 0:
             raise ValueError(
@@ -60,34 +134,46 @@ class GSScene:
                 f"f_rest count {f_rest_count} does not match any SH degree"
             )
         self.sh_degree = sh_degree
+        N = v.shape[0]
 
-        self.xyz = torch.tensor(np.stack([v['x'], v['y'], v['z']], axis=-1)).float().cuda()
-        self.opacities = torch.sigmoid(torch.tensor(v['opacity']).float().unsqueeze(-1)).cuda()
-        self.scales = torch.exp(torch.tensor(np.stack([v['scale_0'], v['scale_1'], v['scale_2']], axis=-1)).float()).cuda()
+        xyz_np = _stack_columns(v, ['x', 'y', 'z'])
+        self.xyz = torch.from_numpy(xyz_np).cuda()
+        del xyz_np
 
-        rot = torch.tensor(np.stack([v['rot_0'], v['rot_1'], v['rot_2'], v['rot_3']], axis=-1)).float().cuda()
+        opacity_np = np.ascontiguousarray(v['opacity'], dtype=np.float32)
+        self.opacities = torch.sigmoid(torch.from_numpy(opacity_np).unsqueeze(-1)).cuda()
+        del opacity_np
+
+        scales_np = _stack_columns(v, ['scale_0', 'scale_1', 'scale_2'])
+        self.scales = torch.exp(torch.from_numpy(scales_np)).cuda()
+        del scales_np
+
+        rot_np = _stack_columns(v, ['rot_0', 'rot_1', 'rot_2', 'rot_3'])
+        rot = torch.from_numpy(rot_np).cuda()
         self.rotations = rot / rot.norm(dim=-1, keepdim=True)
+        del rot_np
 
-        self.sh_dc = torch.tensor(np.stack([v['f_dc_0'], v['f_dc_1'], v['f_dc_2']], axis=-1)).float().unsqueeze(1).cuda()
-
+        # Assemble the SH buffer directly on the GPU as (N, 1 + n_per_channel, 3):
+        # slot 0 is the DC term, the rest follow. Building it in place avoids
+        # keeping a second full copy of the SH coefficients around (a host cat or
+        # a separate sh_rest tensor), which on a degree-3 splat is ~1.3 GB.
+        self._shs = torch.empty((N, 1 + n_per_channel, 3), device='cuda')
+        dc_np = _stack_columns(v, ['f_dc_0', 'f_dc_1', 'f_dc_2'])
+        self._shs[:, 0, :] = torch.from_numpy(dc_np).cuda()
+        del dc_np
         if n_per_channel > 0:
             f_rest_names = [f'f_rest_{i}' for i in range(f_rest_count)]
-            f_rest = np.stack([v[name] for name in f_rest_names], axis=-1)
-            # INRIA PLY storage: (N, 3, n_per_channel) flattened row-major to (N, 3*n_per_channel).
-            # Reverse: reshape -> (N, 3, n_per_channel), transpose -> (N, n_per_channel, 3).
-            self.sh_rest = (
-                torch.tensor(f_rest)
-                .float()
-                .reshape(-1, 3, n_per_channel)
-                .transpose(1, 2)
-                .cuda()
-            )
-        else:
-            N = self.xyz.shape[0]
-            self.sh_rest = torch.zeros((N, 0, 3), device='cuda')
+            rest_np = _stack_columns(v, f_rest_names)
+            # INRIA PLY storage: (N, 3, n_per_channel) flattened row-major to
+            # (N, 3*n_per_channel). Reverse: reshape -> (N, 3, n_per_channel),
+            # transpose -> (N, n_per_channel, 3).
+            rest = torch.from_numpy(rest_np).cuda().reshape(N, 3, n_per_channel).transpose(1, 2)
+            self._shs[:, 1:, :] = rest
+            del rest_np, rest
 
-        # Static per-render buffers that never change across calls.
-        self._shs = torch.cat([self.sh_dc, self.sh_rest], dim=1).contiguous()
+        del v  # release the memmap
+
+        # Static per-render buffer that never changes across calls.
         self._means2D = torch.zeros_like(self.xyz)
         self._bg = torch.zeros(3, device='cuda')
         self._proj_cache = {}

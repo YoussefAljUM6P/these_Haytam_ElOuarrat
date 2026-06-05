@@ -11,8 +11,14 @@ import csv
 import json
 import math
 import re
-from datetime import datetime
 from pathlib import Path
+
+from run_layout import (
+    unique_run_root,
+    write_command,
+    write_json as write_run_json,
+    write_run_readme,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -26,7 +32,7 @@ INDEX_AWAY = 1
 TARGET_INDEX = None
 ITERATIONS = 100
 DT = 1.0
-DEPTH_MODE = "intrinsic"  # "learned" = MoGe2, "intrinsic" = scene.render_depth()
+DEPTH_MODE = "intrinsic"  # "intrinsic" = scene.render_depth()
 FEATURE_METHOD = "sift"
 VIZ_ITER = 1
 GAIN_IBVS = 0.75
@@ -185,6 +191,78 @@ def load_scene_and_frames(scene_dir, renderer):
     if not frame_index:
         raise RuntimeError(f"No frames loaded for {renderer} from {scene_dir}")
     return scene, frame_index
+
+
+def depth_preflight(
+    scene,
+    camera,
+    *,
+    renderer,
+    frame_id,
+    min_depth=1.0e-4,
+    min_valid_pixels=6,
+):
+    import numpy as np
+
+    render_depth = getattr(scene, "render_depth", None)
+    if not callable(render_depth):
+        raise RuntimeError(
+            f"renderer {renderer} has no render_depth() for COLMAP frame {frame_id}"
+        )
+
+    try:
+        depth = np.asarray(render_depth(camera), dtype=np.float32)
+    except Exception as exc:
+        raise RuntimeError(
+            f"renderer {renderer} failed depth preflight for COLMAP frame "
+            f"{frame_id}: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    finite = np.isfinite(depth)
+    positive = finite & (depth > float(min_depth))
+    valid_pixels = int(np.count_nonzero(positive))
+    total_pixels = int(depth.size)
+    finite_pixels = int(np.count_nonzero(finite))
+    finite_ratio = (float(finite_pixels) / float(total_pixels)) if total_pixels else 0.0
+
+    if valid_pixels:
+        valid_depths = depth[positive]
+        min_valid_depth = float(valid_depths.min())
+        max_valid_depth = float(valid_depths.max())
+    else:
+        min_valid_depth = float("nan")
+        max_valid_depth = float("nan")
+
+    info = {
+        "renderer": str(renderer),
+        "frame_id": str(frame_id),
+        "valid_pixels": valid_pixels,
+        "total_pixels": total_pixels,
+        "finite_pixels": finite_pixels,
+        "finite_ratio": finite_ratio,
+        "min_depth": min_valid_depth,
+        "max_depth": max_valid_depth,
+        "min_depth_threshold": float(min_depth),
+        "min_valid_pixels": int(min_valid_pixels),
+    }
+
+    if valid_pixels < int(min_valid_pixels):
+        raise RuntimeError(
+            f"renderer {renderer} produced {valid_pixels} valid depth pixels "
+            f"for COLMAP frame {frame_id} "
+            f"(need >= {int(min_valid_pixels)}, finite_ratio={finite_ratio:.6f}, "
+            f"min_depth={format_stat(min_valid_depth, 6)}, "
+            f"max_depth={format_stat(max_valid_depth, 6)})"
+        )
+
+    return info
+
+
+def needs_intrinsic_depth_preflight(controller_kind, depth_mode):
+    return (
+        str(depth_mode) == "intrinsic"
+        and str(controller_kind) in ("photometric", "photometric_torch")
+    )
 
 
 def rotation_error_from_pose(T_world_cam, target_T_world_cam):
@@ -465,23 +543,23 @@ def make_trial_name(start_index, target_index, depth_mode):
 
 
 def make_run_dir(controller, scene_name, renderer, start_index, target_index, depth_mode):
-    trial_dir = (
-        RUNS_ROOT
-        / controller_short_name(controller)
-        / renderer
-        / scene_name
-        / make_trial_name(start_index, target_index, depth_mode)
-    )
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    trial_dir = RUNS_ROOT / "servo_frames"
     active_gain = GAIN_PHOTO if CONTROLLER != "ibvs" else GAIN_IBVS
-    tag = make_run_tag(active_gain, FEATURE_METHOD, RATIO)
-    base = f"{timestamp}_{tag}"
-    candidate = trial_dir / base
-    suffix = 2
-    while candidate.exists():
-        candidate = trial_dir / f"{base}_{suffix:02d}"
-        suffix += 1
-    return trial_dir, candidate
+    run_tag = RUN_NAME or make_run_tag(active_gain, FEATURE_METHOD, RATIO)
+    output_dir = unique_run_root(
+        RUNS_ROOT,
+        "servo_frames",
+        [
+            scene_name,
+            renderer,
+            controller_short_name(controller),
+            depth_mode,
+            FEATURE_METHOD,
+            f"{int(start_index)}-to-{int(target_index)}",
+            run_tag,
+        ],
+    )
+    return trial_dir, output_dir
 
 
 TRIAL_INDEX_FIELDS = [
@@ -528,6 +606,37 @@ def camera_metadata(camera):
     }
 
 
+def _summary_cell(value):
+    return str(value).replace("|", "\\|")
+
+
+def write_servo_summary_markdown(path, summary):
+    rows = [
+        ("Scene", Path(summary["scene_dir"]).name),
+        ("Renderer", summary["renderer"]),
+        ("Controller", summary["controller"]),
+        ("Frames", f"{summary['start_frame']} -> {summary['target_frame']}"),
+        ("Depth", summary["depth"]),
+        ("Feature", summary["feature_method"]),
+        ("Iterations", f"{summary['iterations_run']}/{summary['iterations']}"),
+        ("Stop", summary["stop_reason"]),
+        ("Translation gap", f"{format_stat(summary['initial_translation_gap'], 6)} -> {format_stat(summary['final_translation_gap'], 6)}"),
+        ("Gap closed", format_percent(summary["translation_gap_closed_pct"])),
+        ("Rotation gap", f"{format_stat(summary['initial_rotation_error_deg'], 4)}deg -> {format_stat(summary['final_rotation_error_deg'], 4)}deg"),
+    ]
+    lines = [
+        "# Servo Frame Summary",
+        "",
+        "Translation values are in COLMAP scene scale.",
+        "",
+        "| Field | Value |",
+        "| ----- | ----- |",
+    ]
+    lines.extend(f"| {_summary_cell(k)} | {_summary_cell(v)} |" for k, v in rows)
+    lines.append("")
+    Path(path).write_text("\n".join(lines))
+
+
 def experiment_config(
     controller_name,
     trial_dir,
@@ -559,6 +668,7 @@ def experiment_config(
         "depth_mode": DEPTH_MODE,
         "feature_method": FEATURE_METHOD,
         "viz_iter": int(VIZ_ITER),
+        "gain": float(GAIN_PHOTO if CONTROLLER != "ibvs" else GAIN_IBVS),
         "gain_ibvs": float(GAIN_IBVS),
         "gain_photo": float(GAIN_PHOTO),
         "min_features": int(MIN_FEATURES),
@@ -606,8 +716,8 @@ def run(args):
     if applied_config:
         print(f"Applied servo config: {format_applied_config(applied_config)}")
 
-    if DEPTH_MODE not in ("learned", "intrinsic"):
-        raise ValueError("DEPTH_MODE must be 'learned' or 'intrinsic'")
+    if DEPTH_MODE != "intrinsic":
+        raise ValueError("DEPTH_MODE must be 'intrinsic'")
 
     scene, frame_index = load_scene_and_frames(SCENE_DIR, RENDERER)
     start_index = int(START_INDEX)
@@ -619,6 +729,22 @@ def run(args):
     target = frame_index[target_frame]
     start_camera = start["camera"]
     target_camera = target["camera"]
+
+    depth_preflight_info = None
+    if needs_intrinsic_depth_preflight(CONTROLLER, DEPTH_MODE):
+        depth_preflight_info = depth_preflight(
+            scene,
+            target_camera,
+            renderer=RENDERER,
+            frame_id=target_frame,
+        )
+        print(
+            f"Depth preflight {RENDERER} {target_frame}: "
+            f"valid={depth_preflight_info['valid_pixels']}/"
+            f"{depth_preflight_info['total_pixels']} "
+            f"range={format_stat(depth_preflight_info['min_depth'], 6)}.."
+            f"{format_stat(depth_preflight_info['max_depth'], 6)}"
+        )
 
     matcher = FeatureMatcher(method=FEATURE_METHOD)
     if CONTROLLER == "ibvs":
@@ -801,6 +927,7 @@ def run(args):
         "final_desired_error_viz": final_photometric_viz.get(
             "visualization_path",
         ),
+        "depth_preflight": depth_preflight_info,
         "initial_translation_gap": initial_translation_gap,
         "final_translation_gap": final_translation_gap,
         "translation_gap_closed_pct": gap_closed_percent(
@@ -816,14 +943,32 @@ def run(args):
         "history": history_for_json(result["history"]),
     }
 
-    with open(output_dir / "summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
-    with open(output_dir / "config.json", "w") as f:
-        json.dump(summary["config"], f, indent=2)
-    with open(logs_dir / "summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
-    with open(logs_dir / "config.json", "w") as f:
-        json.dump(summary["config"], f, indent=2)
+    write_run_json(output_dir / "summary.json", summary)
+    write_run_json(output_dir / "config.resolved.json", summary["config"])
+    write_run_json(output_dir / "config.json", summary["config"])
+    write_command(output_dir / "command.txt")
+    write_servo_summary_markdown(output_dir / "summary.md", summary)
+    write_run_readme(
+        output_dir / "README.md",
+        "SERVIS Servo Frame Run",
+        fields=[
+            ("scene", SCENE_DIR.name),
+            ("renderer", RENDERER),
+            ("controller", controller_name),
+            ("frames", f"{start_frame} -> {target_frame}"),
+            ("depth", DEPTH_MODE),
+            ("feature", FEATURE_METHOD),
+        ],
+        artifacts=[
+            ("summary table", "summary.md"),
+            ("machine summary", "summary.json"),
+            ("resolved config", "config.resolved.json"),
+            ("history", "history.csv"),
+            ("visualizations", "visualizations/"),
+        ],
+    )
+    write_run_json(logs_dir / "summary.json", summary)
+    write_run_json(logs_dir / "config.json", summary["config"])
 
     append_trial_index(trial_dir, {
         "run_dir": output_dir.name,

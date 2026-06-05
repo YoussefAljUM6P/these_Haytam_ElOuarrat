@@ -1,6 +1,6 @@
 """Offline re-rendering of a previous trajectory run.
 
-Given a `<run>/<scene>/` directory produced by `cli.py trajectory`, rebuild
+Given a trajectory scene directory produced by `cli.py trajectory`, rebuild
 the scene + camera intrinsics from `summary.json`, parse `sim_traj.tum`
 (and optionally `gt_traj.tum`), and render each pose to disk.
 
@@ -62,7 +62,7 @@ def load_per_task_targets(csv_path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_scene_dir", type=Path,
-                        help="Path like RUNS/trajectory/<renderer>/<run>/<scene>/")
+                        help="Path like RUNS/trajectory/<run>/scenes/<scene>/")
     parser.add_argument("--gt", action="store_true",
                         help="Also render gt_traj.tum poses.")
     parser.add_argument("--side-by-side", action="store_true",

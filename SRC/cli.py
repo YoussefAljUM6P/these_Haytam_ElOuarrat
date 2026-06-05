@@ -25,6 +25,7 @@ from types import SimpleNamespace
 
 from runners import inspect as runner_inspect
 from runners import matrix as runner_matrix
+from runners import mesh_check as runner_mesh_check
 from runners import servo_frames as runner_servo_frames
 from runners import smoke as runner_smoke
 from runners import trajectory as runner_trajectory
@@ -55,6 +56,10 @@ SUBCOMMANDS = {
     "inspect": {
         "runner": runner_inspect,
         "help": "Render pose at frame N and compare to real image (optional features).",
+    },
+    "mesh-check": {
+        "runner": runner_mesh_check,
+        "help": "Check mesh.ply visibility in COLMAP camera frames.",
     },
 }
 
@@ -88,6 +93,11 @@ def dispatch(args):
 
 
 TASKS = {
+    "compare_table": {
+        "kind": "trajectory",
+        "command": "trajectory",
+        "label": "Compare    — trajectories on all datasets + Markdown table",
+    },
     "trajectory": {
         "kind": "trajectory",
         "command": "trajectory",
@@ -111,7 +121,7 @@ CONTROLLERS = {
     "photometric_torch": "PVS  (photometric, PyTorch / ViSP port)",
 }
 
-DEPTH_MODES = ["intrinsic", "learned"]
+DEPTH_MODES = ["intrinsic"]
 FEATURE_METHODS = ["sift", "xfeat"]
 
 
@@ -139,6 +149,24 @@ def list_scenes():
             continue
         scenes.append((entry.name, detect_renderers(entry)))
     return scenes
+
+
+def renderable_scenes(scenes):
+    return [(name, renderers) for name, renderers in scenes if renderers]
+
+
+def ordered_renderers(scene_items, common=False):
+    if not scene_items:
+        return []
+    if common:
+        available = set(scene_items[0][1])
+        for _, renderers in scene_items[1:]:
+            available &= set(renderers)
+    else:
+        available = set()
+        for _, renderers in scene_items:
+            available.update(renderers)
+    return [r for r in ("mesh", "gs", "nerf") if r in available]
 
 
 def write_config(cfg, task_key, scene_name):
@@ -346,7 +374,6 @@ def wizard():
                 "Depth mode:",
                 [
                     Choice("intrinsic  — scene.render_depth()", value="intrinsic"),
-                    Choice("learned    — MoGe2", value="learned"),
                 ],
                 default="intrinsic",
             ),
@@ -441,11 +468,11 @@ def wizard():
         cfg.update(run_prompt(loop_qs))
         return cfg
 
-    def build_trajectory_config(controller, scene_name, renderers):
+    def build_trajectory_config(controller, datasets, renderers, run_tag_default=None):
         is_ibvs = controller == "ibvs"
         is_photo = controller in ("photometric", "photometric_torch")
 
-        cfg = {"kind": "trajectory", "datasets": [scene_name], "controller": controller}
+        cfg = {"kind": "trajectory", "datasets": list(datasets), "controller": controller}
 
         if is_photo:
             console.rule("[bold magenta]Photometric controller knobs[/]")
@@ -497,7 +524,13 @@ def wizard():
         stop_qs += [
             q_confirm("save_task_viz", "Save per-task viz?", default=True),
             q_text("task_viz_every", "Save viz every N tasks:", 1, int),
-            q_text("run_tag", "Run tag (blank = auto):", None, str, optional=True),
+            q_text(
+                "run_tag",
+                "Run tag (blank = auto):",
+                run_tag_default,
+                str,
+                optional=True,
+            ),
         ]
         cfg.update(run_prompt(stop_qs))
         return cfg
@@ -586,29 +619,56 @@ def wizard():
         default="ibvs",
     )
 
-    scene_name = ask_select(
-        "Scene:",
-        [
-            Choice(
-                f"{name}   [{', '.join(rs) if rs else 'no renderable assets'}]",
-                value=name,
+    if task_key == "compare_table":
+        comparison_scenes = renderable_scenes(scenes)
+        if not comparison_scenes:
+            console.print(
+                "[red]No renderable datasets found under DATA/ "
+                "(expected mesh.ply, gs.ply, or nerf/).[/]"
             )
-            for name, rs in scenes
-        ],
-        default=scenes[0][0],
-    )
-    scene_renderers = dict(scenes)[scene_name]
-    if not scene_renderers:
+            return 1
+        comparison_datasets = [name for name, _ in comparison_scenes]
+        scene_renderers = ordered_renderers(comparison_scenes, common=True)
+        if not scene_renderers:
+            scene_renderers = ordered_renderers(comparison_scenes, common=False)
+            console.print(
+                "[yellow]No renderer is available in every dataset; datasets "
+                "missing the selected renderer will be marked failed in the table.[/]"
+            )
         console.print(
-            f"[red]Scene {scene_name!r} has no renderable assets "
-            f"(expected mesh.ply, gs.ply, or nerf/).[/]"
+            "[grey50]datasets:[/] " + ", ".join(comparison_datasets)
         )
-        return 1
-
-    if task_key == "servo_frames":
-        cfg = build_servo_frames_config(controller, scene_name, scene_renderers)
+        scene_name = "all_datasets"
+        cfg = build_trajectory_config(
+            controller,
+            comparison_datasets,
+            scene_renderers,
+            run_tag_default="compare_all",
+        )
     else:
-        cfg = build_trajectory_config(controller, scene_name, scene_renderers)
+        scene_name = ask_select(
+            "Scene:",
+            [
+                Choice(
+                    f"{name}   [{', '.join(rs) if rs else 'no renderable assets'}]",
+                    value=name,
+                )
+                for name, rs in scenes
+            ],
+            default=scenes[0][0],
+        )
+        scene_renderers = dict(scenes)[scene_name]
+        if not scene_renderers:
+            console.print(
+                f"[red]Scene {scene_name!r} has no renderable assets "
+                f"(expected mesh.ply, gs.ply, or nerf/).[/]"
+            )
+            return 1
+
+        if task_key == "servo_frames":
+            cfg = build_servo_frames_config(controller, scene_name, scene_renderers)
+        else:
+            cfg = build_trajectory_config(controller, [scene_name], scene_renderers)
 
     console.print()
     console.print(

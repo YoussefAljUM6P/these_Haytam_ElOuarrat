@@ -1,7 +1,7 @@
 """Compile saved trajectory visualizations into a video.
 
 Examples:
-  python SRC/trajectory_visuals_to_video.py --run-dir RUNS/trajectory/gs/20260511-120000_sift_stride1_iters10
+  python SRC/trajectory_visuals_to_video.py --run-dir RUNS/trajectory/20260524-153012_living_gs_ibvs_intrinsic_sift
   python SRC/trajectory_visuals_to_video.py --latest --fps 8
 """
 
@@ -37,14 +37,40 @@ def latest_trajectory_run():
         raise FileNotFoundError(f"No trajectory runs found under {base}")
 
     candidates = []
-    for renderer_dir in base.iterdir():
-        if not renderer_dir.is_dir():
+    for entry in base.iterdir():
+        if not entry.is_dir():
             continue
-        candidates.extend(path for path in renderer_dir.iterdir() if path.is_dir())
+        if entry.name in {"mesh", "gs", "nerf"}:
+            candidates.extend(path for path in entry.iterdir() if path.is_dir())
+        else:
+            candidates.append(entry)
 
     if not candidates:
         raise FileNotFoundError(f"No trajectory run directories found under {base}")
     return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def scene_dir_for(run_dir, scene):
+    direct = run_dir / scene
+    nested = run_dir / "scenes" / scene
+    if nested.exists() or not direct.exists():
+        return nested
+    return direct
+
+
+def iter_scene_dirs(run_dir):
+    if (run_dir / "summary.json").exists() and (run_dir / "sim_traj.tum").exists():
+        return [run_dir]
+    scenes_dir = run_dir / "scenes"
+    if scenes_dir.exists():
+        return sorted(
+            (path for path in scenes_dir.iterdir() if path.is_dir()),
+            key=natural_key,
+        )
+    return sorted(
+        (path for path in run_dir.iterdir() if path.is_dir()),
+        key=natural_key,
+    )
 
 
 def resolve_existing_run_dir(run_dir):
@@ -82,7 +108,11 @@ def collect_manifest_frames(run_dir, scene=None):
     if (run_dir / "per_task_errors.csv").exists():
         csv_paths = [run_dir / "per_task_errors.csv"]
     else:
-        csv_paths = sorted(run_dir.glob("*/per_task_errors.csv"), key=natural_key)
+        csv_paths = sorted(
+            list((run_dir / "scenes").glob("*/per_task_errors.csv"))
+            + list(run_dir.glob("*/per_task_errors.csv")),
+            key=natural_key,
+        )
 
     for csv_path in csv_paths:
         scene_name = csv_path.parent.name
@@ -108,11 +138,11 @@ def collect_manifest_frames(run_dir, scene=None):
 
 def collect_glob_frames(run_dir, scene=None, pattern="visualizations/*.png"):
     if scene is not None:
-        search_roots = [run_dir / scene]
+        search_roots = [scene_dir_for(run_dir, scene)]
     elif (run_dir / "visualizations").exists():
         search_roots = [run_dir]
     else:
-        search_roots = [path for path in run_dir.iterdir() if path.is_dir()]
+        search_roots = iter_scene_dirs(run_dir)
 
     frames = []
     for root in search_roots:
@@ -228,15 +258,12 @@ def render_missing_scene_visuals(
 
 
 def render_missing_visuals(run_dir, scene=None, max_frames=None):
-    if (run_dir / "summary.json").exists():
+    if (run_dir / "summary.json").exists() and (run_dir / "sim_traj.tum").exists():
         scene_dirs = [run_dir]
     elif scene is not None:
-        scene_dirs = [run_dir / scene]
+        scene_dirs = [scene_dir_for(run_dir, scene)]
     else:
-        scene_dirs = sorted(
-            (path for path in run_dir.iterdir() if path.is_dir()),
-            key=natural_key,
-        )
+        scene_dirs = iter_scene_dirs(run_dir)
 
     frame_paths = []
     for scene_dir in scene_dirs:
@@ -307,12 +334,12 @@ def parse_args():
     group.add_argument(
         "--run-dir",
         type=Path,
-        help="Trajectory run root, e.g. RUNS/trajectory/gs/<timestamp_tag>.",
+        help="Trajectory run root, e.g. RUNS/trajectory/<run_id>.",
     )
     group.add_argument(
         "--latest",
         action="store_true",
-        help="Use the newest run under RUNS/trajectory/*/.",
+        help="Use the newest run under RUNS/trajectory/.",
     )
     parser.add_argument(
         "--scene",

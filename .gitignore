@@ -13,9 +13,13 @@ CONFIGS/*.local.json
 # Heavy data and experiment outputs (NEVER commit)
 # =============================================================================
 DATA/
+data/
 RUNS/
 runs/
 runs_*/
+# Local backups / duplicated scene folders (e.g. "DATA (Copy)")
+*(Copy)*/
+* copy/
 output/
 outputs/
 out/
@@ -32,8 +36,6 @@ depth_comparison/
 servo_mesh/
 servo_gs/
 kitchen-instant-ngp-tcnn/
-MOGE_3DGS/runs/
-MOGE_3DGS/scripts/runs/
 
 # COLMAP / SfM artifacts (regenerate from scans)
 **/sparse/

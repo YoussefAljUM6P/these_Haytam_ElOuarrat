@@ -107,7 +107,7 @@ KIND_ALIASES = {
 }
 
 RENDERERS = {"mesh", "gs", "nerf"}
-DEPTH_MODES = {"learned", "intrinsic"}
+DEPTH_MODES = {"intrinsic"}
 CONTROLLERS = {"ibvs", "photometric", "photometric_torch"}
 
 INT_KEYS = {

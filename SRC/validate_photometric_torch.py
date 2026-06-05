@@ -428,12 +428,6 @@ def test_torch_sim_to_sim_moves_and_closes_gap():
     )
 
 
-def _valid_depth_pixels(scene, camera, min_depth=1e-4):
-    depth = np.asarray(scene.render_depth(camera), dtype=np.float32)
-    valid = np.isfinite(depth) & (depth > float(min_depth))
-    return int(valid.sum())
-
-
 # ---- integration: render-vs-real on a COLMAP dataset -----------------------
 #
 # Project goal: drive a virtual camera (mesh/GS render) until its render
@@ -457,6 +451,7 @@ def _try_render_vs_real():
 
     try:
         from runners.servo_frames import (
+            depth_preflight,
             load_rgb,
             load_scene_and_frames,
             sorted_frame_ids,
@@ -492,17 +487,16 @@ def _try_render_vs_real():
                         f"{target_rgb_path}"
                     )
                     continue
-                valid_depth_pixels = _valid_depth_pixels(scene, target_camera)
-                if valid_depth_pixels < 6:
-                    load_errors.append(
-                        f"{scene_name}/{renderer}: target intrinsic depth has "
-                        f"{valid_depth_pixels} valid pixels"
-                    )
-                    continue
+                preflight_info = depth_preflight(
+                    scene,
+                    target_camera,
+                    renderer=renderer,
+                    frame_id=target_frame_id,
+                )
                 selected = (
                     scene_name, renderer, scene, start_camera, target_camera,
                     target_rgb_path, start_frame_id, target_frame_id,
-                    valid_depth_pixels,
+                    preflight_info,
                 )
                 break
             except Exception as exc:
@@ -515,7 +509,7 @@ def _try_render_vs_real():
 
     (
         scene_name, renderer, scene, start_camera, target_camera,
-        target_rgb_path, start_frame_id, target_frame_id, valid_depth_pixels,
+        target_rgb_path, start_frame_id, target_frame_id, preflight_info,
     ) = selected
     target_image = load_rgb(target_rgb_path, start_camera.W, start_camera.H)
 
@@ -553,7 +547,8 @@ def _try_render_vs_real():
         "renderer": renderer,
         "start_frame": start_frame_id,
         "target_frame": target_frame_id,
-        "valid_depth_pixels": int(valid_depth_pixels),
+        "valid_depth_pixels": int(preflight_info["valid_pixels"]),
+        "depth_preflight": preflight_info,
     })
     return summary, None
 
