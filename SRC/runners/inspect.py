@@ -9,6 +9,8 @@ Use via the CLI:
 from datetime import datetime
 from pathlib import Path
 
+from scene_assets import has_nerfstudio_checkpoint
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_ROOT = PROJECT_ROOT / "DATA"
@@ -56,11 +58,7 @@ def _detect_renderers(scene_dir):
         available.append("mesh")
     if (scene_dir / "gs.ply").exists():
         available.append("gs")
-    if (
-        (scene_dir / "nerf").is_dir()
-        or list(scene_dir.glob("*-instant-ngp-tcnn"))
-        or list(scene_dir.glob("step-*.ckpt"))
-    ):
+    if has_nerfstudio_checkpoint(scene_dir):
         available.append("nerf")
     return available
 

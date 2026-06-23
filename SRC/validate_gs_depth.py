@@ -24,9 +24,15 @@ def make_synthetic_gs_scene(xyz, opacities, scales=None):
     scene.scales = torch.tensor(scales).float().cuda()
     scene.rotations = torch.tensor([[1.0, 0.0, 0.0, 0.0]] * len(xyz)).float().cuda()
     scene.sh_degree = 0
-    scene.sh_dc = torch.zeros((len(xyz), 1, 3), device="cuda")
-    scene.sh_rest = torch.zeros((len(xyz), 0, 3), device="cuda")
+    scene._shs = torch.zeros((len(xyz), 1, 3), device="cuda")
+    scene._means2D = torch.zeros_like(scene.xyz)
+    scene._depth_colors = torch.empty_like(scene.xyz)
+    scene._depth_colors[:, 2] = 1.0
+    scene._bg = torch.zeros(3, device="cuda")
+    scene._proj_cache = {}
     scene._last_camera = None
+    scene._last_depth_key = None
+    scene._last_depth = None
     return scene
 
 

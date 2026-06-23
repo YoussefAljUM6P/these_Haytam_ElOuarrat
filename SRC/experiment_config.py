@@ -22,6 +22,7 @@ _PHOTOMETRIC_KEYS = {
 TRAJECTORY_CONFIG_KEYS = {
     "datasets": "DATASETS",
     "renderer": "RENDERER",
+    "gs_model": "GS_MODEL",
     "nerf_render_scale": "NERF_RENDER_SCALE",
     "stride": "STRIDE",
     "mini_iterations": "MINI_ITERATIONS",
@@ -34,10 +35,20 @@ TRAJECTORY_CONFIG_KEYS = {
     "ratio": "RATIO",
     "start_index": "START_INDEX",
     "max_pairs": "MAX_PAIRS",
+    "use_takes": "USE_TAKES",
+    "takes_jump_factor": "TAKES_JUMP_FACTOR",
     "stop_residual_px": "STOP_RESIDUAL_PX",
     "stop_mse_per_px": "STOP_MSE_PER_PX",
+    "diverge_residual_px": "DIVERGE_RESIDUAL_PX",
+    "diverge_mse_per_px": "DIVERGE_MSE_PER_PX",
     "min_interaction_rank": "MIN_INTERACTION_RANK",
     "max_interaction_condition": "MAX_INTERACTION_CONDITION",
+    "max_translation_step": "MAX_TRANSLATION_STEP",
+    "max_rotation_step_deg": "MAX_ROTATION_STEP_DEG",
+    "hard_translation_step": "HARD_TRANSLATION_STEP",
+    "hard_rotation_step_deg": "HARD_ROTATION_STEP_DEG",
+    "adaptive_step_fraction": "ADAPTIVE_STEP_FRACTION",
+    "continue_on_task_failure": "CONTINUE_ON_TASK_FAILURE",
     "dynamic_ibvs_iters": "DYNAMIC_IBVS_ITERS",
     "rpe_delta": "RPE_DELTA",
     "run_tag": "RUN_TAG",
@@ -49,6 +60,7 @@ TRAJECTORY_CONFIG_KEYS = {
 SERVO_FRAMES_CONFIG_KEYS = {
     "scene_dir": "SCENE_DIR",
     "renderer": "RENDERER",
+    "gs_model": "GS_MODEL",
     "start_index": "START_INDEX",
     "index_away": "INDEX_AWAY",
     "target_index": "TARGET_INDEX",
@@ -66,6 +78,11 @@ SERVO_FRAMES_CONFIG_KEYS = {
     "stop_mse_per_px": "STOP_MSE_PER_PX",
     "min_interaction_rank": "MIN_INTERACTION_RANK",
     "max_interaction_condition": "MAX_INTERACTION_CONDITION",
+    "max_translation_step": "MAX_TRANSLATION_STEP",
+    "max_rotation_step_deg": "MAX_ROTATION_STEP_DEG",
+    "hard_translation_step": "HARD_TRANSLATION_STEP",
+    "hard_rotation_step_deg": "HARD_ROTATION_STEP_DEG",
+    "adaptive_step_fraction": "ADAPTIVE_STEP_FRACTION",
     **_PHOTOMETRIC_KEYS,
 }
 
@@ -91,6 +108,8 @@ KIND_ALIASES = {
         "save_viz": "save_task_viz",
         "task_viz": "save_task_viz",
         "task_viz_stride": "task_viz_every",
+        "continue_after_failure": "continue_on_task_failure",
+        "cut_on_failure": "continue_on_task_failure",
         "tag": "run_tag",
         "nerf_scale": "nerf_render_scale",
         "render_scale": "nerf_render_scale",
@@ -107,8 +126,9 @@ KIND_ALIASES = {
 }
 
 RENDERERS = {"mesh", "gs", "nerf"}
+GS_MODELS = {"standard", "moge"}
 DEPTH_MODES = {"learned", "intrinsic"}
-CONTROLLERS = {"ibvs", "photometric", "photometric_torch"}
+CONTROLLERS = {"ibvs", "photometric"}
 
 INT_KEYS = {
     "stride",
@@ -133,11 +153,30 @@ FLOAT_KEYS = {
     "nerf_render_scale",
     "stop_residual_px",
     "stop_mse_per_px",
+    "diverge_residual_px",
+    "diverge_mse_per_px",
     "sigma_blur",
     "grad_percentile",
+    "takes_jump_factor",
+    "adaptive_step_fraction",
 }
-OPTIONAL_FLOAT_KEYS = {"huber_k", "stop_ssd", "max_interaction_condition"}
-BOOL_KEYS = {"save_task_viz", "use_gzn", "use_huber", "dynamic_ibvs_iters"}
+OPTIONAL_FLOAT_KEYS = {
+    "huber_k",
+    "stop_ssd",
+    "max_interaction_condition",
+    "max_translation_step",
+    "max_rotation_step_deg",
+    "hard_translation_step",
+    "hard_rotation_step_deg",
+}
+BOOL_KEYS = {
+    "save_task_viz",
+    "use_gzn",
+    "use_huber",
+    "dynamic_ibvs_iters",
+    "use_takes",
+    "continue_on_task_failure",
+}
 OPTIONAL_STR_KEYS = {"run_tag", "run_name"}
 
 
@@ -255,6 +294,15 @@ def coerce_config_value(key, value):
             raise ValueError("sigma_blur must be >= 0")
         if key == "grad_percentile" and not (0.0 <= value < 100.0):
             raise ValueError("grad_percentile must be in [0, 100)")
+        if key in {
+            "stop_residual_px",
+            "stop_mse_per_px",
+            "diverge_residual_px",
+            "diverge_mse_per_px",
+        } and value <= 0.0:
+            raise ValueError(f"{key} must be > 0")
+        if key == "adaptive_step_fraction" and value < 0.0:
+            raise ValueError("adaptive_step_fraction must be >= 0")
         return value
     if key in OPTIONAL_FLOAT_KEYS:
         if is_null_value(value):
@@ -262,6 +310,13 @@ def coerce_config_value(key, value):
         value = float(value)
         if key == "max_interaction_condition" and value <= 0.0:
             raise ValueError("max_interaction_condition must be > 0 or null")
+        if key in {
+            "max_translation_step",
+            "max_rotation_step_deg",
+            "hard_translation_step",
+            "hard_rotation_step_deg",
+        } and value <= 0.0:
+            raise ValueError(f"{key} must be > 0 or null")
         return value
     if key in BOOL_KEYS:
         return coerce_bool(value)
@@ -278,6 +333,11 @@ def coerce_config_value(key, value):
         value = str(value).lower()
         if value not in RENDERERS:
             raise ValueError(f"renderer must be one of {sorted(RENDERERS)}")
+        return value
+    if key == "gs_model":
+        value = str(value).lower()
+        if value not in GS_MODELS:
+            raise ValueError(f"gs_model must be one of {sorted(GS_MODELS)}")
         return value
     if key == "depth_mode":
         value = str(value).lower()

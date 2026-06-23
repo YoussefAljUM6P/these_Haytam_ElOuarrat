@@ -23,12 +23,14 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+from runners import compare as runner_compare
 from runners import inspect as runner_inspect
 from runners import matrix as runner_matrix
 from runners import mesh_check as runner_mesh_check
 from runners import servo_frames as runner_servo_frames
 from runners import smoke as runner_smoke
 from runners import trajectory as runner_trajectory
+from scene_assets import has_nerfstudio_checkpoint
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -52,6 +54,10 @@ SUBCOMMANDS = {
     "matrix": {
         "runner": runner_matrix,
         "help": "Servo matrix sweep (scene x depth x matcher).",
+    },
+    "compare": {
+        "runner": runner_compare,
+        "help": "Variant x dataset benchmark sweep (renderer/depth/feature axes).",
     },
     "inspect": {
         "runner": runner_inspect,
@@ -117,8 +123,7 @@ TASKS = {
 
 CONTROLLERS = {
     "ibvs": "FBVS (feature-based / IBVS)",
-    "photometric": "PVS  (photometric, NumPy)",
-    "photometric_torch": "PVS  (photometric, PyTorch / ViSP port)",
+    "photometric": "PVS  (photometric)",
 }
 
 DEPTH_MODES = ["intrinsic", "learned"]
@@ -131,11 +136,7 @@ def detect_renderers(scene_dir):
         available.append("mesh")
     if (scene_dir / "gs.ply").exists():
         available.append("gs")
-    if (
-        (scene_dir / "nerf").is_dir()
-        or list(scene_dir.glob("*-instant-ngp-tcnn"))
-        or list(scene_dir.glob("step-*.ckpt"))
-    ):
+    if has_nerfstudio_checkpoint(scene_dir):
         available.append("nerf")
     return available
 
@@ -360,7 +361,7 @@ def wizard():
 
     def common_questions(controller, renderers):
         is_ibvs = controller == "ibvs"
-        is_photo = controller in ("photometric", "photometric_torch")
+        is_photo = controller == "photometric"
 
         qs = [
             q_select(
@@ -403,7 +404,7 @@ def wizard():
 
     def build_servo_frames_config(controller, scene_name, renderers):
         is_ibvs = controller == "ibvs"
-        is_photo = controller in ("photometric", "photometric_torch")
+        is_photo = controller == "photometric"
 
         cfg = {"kind": "servo_frames", "scene_dir": scene_name, "controller": controller}
 
@@ -471,7 +472,7 @@ def wizard():
 
     def build_trajectory_config(controller, datasets, renderers, run_tag_default=None):
         is_ibvs = controller == "ibvs"
-        is_photo = controller in ("photometric", "photometric_torch")
+        is_photo = controller == "photometric"
 
         cfg = {"kind": "trajectory", "datasets": list(datasets), "controller": controller}
 
@@ -511,7 +512,13 @@ def wizard():
                     "IBVS stop: RMS reprojection error (px):",
                     0.5,
                     float,
-                )
+                ),
+                q_text(
+                    "diverge_residual_px",
+                    "IBVS abort if final error exceeds px:",
+                    1000.0,
+                    float,
+                ),
             ]
         if is_photo:
             stop_qs += [
@@ -520,9 +527,20 @@ def wizard():
                     "Photometric stop: mean(e^2) per pixel on [0,1]:",
                     2.0e-6,
                     float,
-                )
+                ),
+                q_text(
+                    "diverge_mse_per_px",
+                    "Photometric abort if final MSE/px exceeds:",
+                    1.0e-2,
+                    float,
+                ),
             ]
         stop_qs += [
+            q_confirm(
+                "continue_on_task_failure",
+                "Cut to target pose and continue after failed tasks?",
+                default=False,
+            ),
             q_confirm("save_task_viz", "Save per-task viz?", default=True),
             q_text("task_viz_every", "Save viz every N tasks:", 1, int),
             q_text(

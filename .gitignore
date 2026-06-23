@@ -156,3 +156,6 @@ DATA/poisson_meshing.pid
 SRC/third_party/**/build/
 SRC/third_party/**/*.egg-info/
 SRC/third_party/**/__pycache__/
+
+# Local ViSP source+build (built from source, not committed)
+visp/

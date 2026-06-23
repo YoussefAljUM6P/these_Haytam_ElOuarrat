@@ -211,6 +211,37 @@ def run_servo_loop(
     render_total = 0.0
     controller_total = 0.0
     viz_total = 0.0
+    render_tensor = getattr(scene, "render_tensor", None)
+    use_tensor_render = (
+        callable(render_tensor)
+        and bool(getattr(controller, "accepts_torch_tensors", False))
+    )
+    cuda_events = None
+    if use_tensor_render:
+        import torch
+        try:
+            cuda_available = bool(torch.cuda.is_available())
+        except Exception:
+            cuda_available = False
+        if cuda_available:
+            try:
+                cuda_events = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+            except Exception:
+                cuda_events = None
+
+    def _as_numpy_image(image):
+        try:
+            import torch
+            if isinstance(image, torch.Tensor):
+                return image.detach().cpu().numpy()
+        except ImportError:
+            pass
+        return np.asarray(image)
+
 
     def _controller_stop_reason() -> Optional[str]:
         controller_should_stop = getattr(controller, "should_stop", None)
@@ -243,12 +274,14 @@ def run_servo_loop(
         *,
         velocity_limited: bool = False,
         velocity_scale: float = 1.0,
+        hard_limit_saturated: bool = False,
     ) -> Dict[str, Any]:
         raw_t, raw_r = _step_metrics(raw_velocity)
         applied_t, applied_r = _step_metrics(applied_velocity)
         return {
             "velocity_limited": bool(velocity_limited),
             "velocity_scale": float(velocity_scale),
+            "hard_limit_saturated": bool(hard_limit_saturated),
             "raw_translation_step": raw_t,
             "raw_rotation_step_deg": raw_r,
             "translation_step": applied_t,
@@ -265,6 +298,11 @@ def run_servo_loop(
         applied_velocity = raw_velocity.copy()
         raw_translation_step, raw_rotation_step_deg = _step_metrics(raw_velocity)
 
+        # A step exceeding the hard limit is almost always a bad linearization
+        # (photometric VS has a small convergence basin). Rather than terminate
+        # the whole servo, saturate it to the soft limit and keep going so the
+        # controller can recover on the next render. Only genuinely non-finite
+        # velocities terminate (handled by the caller before this point).
         exceeds_hard_translation = (
             hard_translation_step is not None
             and raw_translation_step > hard_translation_step
@@ -273,13 +311,7 @@ def run_servo_loop(
             hard_rotation_step_deg is not None
             and raw_rotation_step_deg > hard_rotation_step_deg
         )
-        if exceeds_hard_translation or exceeds_hard_rotation:
-            zero_velocity = np.zeros(6, dtype=np.float32)
-            return (
-                zero_velocity,
-                _motion_info(raw_velocity, zero_velocity),
-                "velocity_invalid_exceeds_hard_limit",
-            )
+        hard_limit_saturated = bool(exceeds_hard_translation or exceeds_hard_rotation)
 
         scales = []
         if (
@@ -305,6 +337,7 @@ def run_servo_loop(
                 applied_velocity,
                 velocity_limited=velocity_limited,
                 velocity_scale=velocity_scale,
+                hard_limit_saturated=hard_limit_saturated,
             ),
             None,
         )
@@ -312,17 +345,43 @@ def run_servo_loop(
     for iteration in range(iterations):
         iter_t0 = perf_counter()
 
-        t0 = perf_counter()
-        rendered = scene.render(camera)
-        render_dt = perf_counter() - t0
-        render_total += render_dt
+        if use_tensor_render:
+            if cuda_events is not None:
+                render_start, render_end, controller_end = cuda_events
+                render_start.record()
+                rendered = render_tensor(camera)
+                render_end.record()
+                velocity = np.asarray(
+                    controller(rendered, target_image, camera, iteration),
+                    dtype=np.float32,
+                )
+                controller_end.record()
+                controller_end.synchronize()
+                render_dt = render_start.elapsed_time(render_end) / 1000.0
+                controller_dt = render_end.elapsed_time(controller_end) / 1000.0
+            else:
+                t0 = perf_counter()
+                rendered = render_tensor(camera)
+                render_dt = perf_counter() - t0
 
-        t0 = perf_counter()
-        velocity = np.asarray(
-            controller(rendered, target_image, camera, iteration),
-            dtype=np.float32,
-        )
-        controller_dt = perf_counter() - t0
+                t0 = perf_counter()
+                velocity = np.asarray(
+                    controller(rendered, target_image, camera, iteration),
+                    dtype=np.float32,
+                )
+                controller_dt = perf_counter() - t0
+        else:
+            t0 = perf_counter()
+            rendered = scene.render(camera)
+            render_dt = perf_counter() - t0
+
+            t0 = perf_counter()
+            velocity = np.asarray(
+                controller(rendered, target_image, camera, iteration),
+                dtype=np.float32,
+            )
+            controller_dt = perf_counter() - t0
+        render_total += render_dt
         controller_total += controller_dt
 
         controller_info = getattr(controller, "last_info", {})
@@ -383,6 +442,7 @@ def run_servo_loop(
         )
         viz_t0 = perf_counter()
         if should_save_viz:
+            rendered_for_viz = _as_numpy_image(rendered)
             controller_visualization = getattr(controller, "last_visualization", None)
             is_photometric = (
                 controller_visualization is not None
@@ -392,7 +452,7 @@ def run_servo_loop(
             if is_photometric:
                 output_path = visualization_dir / f"iter_{iteration:04d}_photometric.png"
                 match_info = save_photometric_visualization(
-                    rendered,
+                    rendered_for_viz,
                     target_image,
                     controller_visualization,
                     output_path,
@@ -404,14 +464,14 @@ def run_servo_loop(
                     and controller_visualization.get("iteration") == iteration
                 ):
                     match_info = save_controller_matches(
-                        rendered,
+                        rendered_for_viz,
                         target_image,
                         controller_visualization,
                         output_path,
                     )
                 else:
                     match_info = save_iteration_matches(
-                        rendered,
+                        rendered_for_viz,
                         target_image,
                         camera,
                         matcher,
@@ -486,6 +546,7 @@ def run_servo_loop(
         "viz_ms_total": float(viz_total * 1000.0),
         "fps": (float(n_iters) / loop_dt) if loop_dt > 0 else 0.0,
         "render_fps": (float(n_iters) / render_total) if render_total > 0 else 0.0,
+        "tensor_render": bool(use_tensor_render),
     }
 
     return {

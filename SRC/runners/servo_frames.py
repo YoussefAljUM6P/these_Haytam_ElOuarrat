@@ -14,7 +14,8 @@ import re
 from pathlib import Path
 
 from run_layout import (
-    unique_run_root,
+    color,
+    run_folder,
     write_command,
     write_json as write_run_json,
     write_run_readme,
@@ -27,6 +28,7 @@ RUNS_ROOT = PROJECT_ROOT / "RUNS"
 # Edit these values to define the frame-to-frame servo experiment.
 SCENE_DIR = PROJECT_ROOT / "DATA" / "kitchen"
 RENDERER = "mesh"  # "mesh", "gs", or "nerf"
+GS_MODEL = "standard"  # "standard" -> gs.ply, "moge" -> gs_moge.ply
 START_INDEX = 1
 INDEX_AWAY = 1
 TARGET_INDEX = None
@@ -45,8 +47,13 @@ STOP_MSE_PER_PX = 2.0e-6    # legacy photometric MSE; used when STOP_SSD is None
 STOP_SSD = None             # photometric: ViSP-style SSD threshold, or None
 MIN_INTERACTION_RANK = 6
 MAX_INTERACTION_CONDITION = 1.0e8
+MAX_TRANSLATION_STEP = 0.5
+MAX_ROTATION_STEP_DEG = 30.0
+HARD_TRANSLATION_STEP = 5.0
+HARD_ROTATION_STEP_DEG = 180.0
+ADAPTIVE_STEP_FRACTION = 0.25
 
-CONTROLLER = "ibvs"  # "ibvs", "photometric", or "photometric_torch"
+CONTROLLER = "ibvs"  # "ibvs" or "photometric"
 SIGMA_BLUR = 1.0
 USE_GZN = True
 GRAD_PERCENTILE = 50.0
@@ -180,7 +187,12 @@ def load_scene_and_frames(scene_dir, renderer):
         scene = MeshScene(scene_dir / "mesh.ply")
     elif renderer == "gs":
         from scenes.gs import GSScene
-        scene = GSScene(scene_dir / "gs.ply")
+        ply_path = scene_dir / ("gs_moge.ply" if GS_MODEL == "moge" else "gs.ply")
+        if not ply_path.exists():
+            raise FileNotFoundError(f"GS model not found: {ply_path}")
+        if GS_MODEL == "moge":
+            print(f"Using MoGe depth-supervised GS {ply_path}")
+        scene = GSScene(ply_path)
     elif renderer == "nerf":
         from scenes.nerf import NeRFScene
         scene = NeRFScene(scene_dir)
@@ -261,7 +273,7 @@ def depth_preflight(
 def needs_intrinsic_depth_preflight(controller_kind, depth_mode):
     return (
         str(depth_mode) == "intrinsic"
-        and str(controller_kind) in ("photometric", "photometric_torch")
+        and str(controller_kind) == "photometric"
     )
 
 
@@ -334,27 +346,52 @@ def controller_error_display(info):
     return "err", format_sci(info.get("residual_norm"))
 
 
-def gap_closed_percent(initial_gap, final_gap):
-    try:
-        initial_gap = float(initial_gap)
-        final_gap = float(final_gap)
-    except (TypeError, ValueError):
-        return float("nan")
-    if not math.isfinite(initial_gap) or not math.isfinite(final_gap):
-        return float("nan")
-    if abs(initial_gap) <= 1e-12:
-        return float("nan")
-    return 100.0 * (initial_gap - final_gap) / initial_gap
+def adaptive_motion_limits(
+    initial_translation_gap,
+    initial_rotation_error_deg,
+    *,
+    max_translation_step,
+    max_rotation_step_deg,
+    adaptive_step_fraction,
+):
+    """Cap per-iteration motion relative to the known frame-to-frame gap."""
+    import math
 
-
-def format_percent(value, digits=1):
-    try:
+    def _optional_positive(value):
+        if value is None:
+            return None
         value = float(value)
+        return value if math.isfinite(value) and value > 0.0 else None
+
+    translation_limit = _optional_positive(max_translation_step)
+    rotation_limit = _optional_positive(max_rotation_step_deg)
+    fraction = float(adaptive_step_fraction)
+    if not math.isfinite(fraction) or fraction <= 0.0:
+        return translation_limit, rotation_limit
+
+    try:
+        t_gap = float(initial_translation_gap)
     except (TypeError, ValueError):
-        return "-"
-    if not math.isfinite(value):
-        return "-"
-    return f"{value:.{int(digits)}f}%"
+        t_gap = float("nan")
+    if math.isfinite(t_gap) and t_gap >= 0.0:
+        adaptive_t = max(1.0e-3, t_gap * fraction)
+        translation_limit = (
+            adaptive_t if translation_limit is None
+            else min(translation_limit, adaptive_t)
+        )
+
+    try:
+        r_gap = float(initial_rotation_error_deg)
+    except (TypeError, ValueError):
+        r_gap = float("nan")
+    if math.isfinite(r_gap) and r_gap >= 0.0:
+        adaptive_r = max(0.25, r_gap * fraction)
+        rotation_limit = (
+            adaptive_r if rotation_limit is None
+            else min(rotation_limit, adaptive_r)
+        )
+
+    return translation_limit, rotation_limit
 
 
 def public_controller_info(info):
@@ -390,7 +427,6 @@ def write_history_csv(path, history):
         "diff_max",
         "diff_mean",
         "translation_gap",
-        "gap_closed_pct",
         "rotation_error_deg",
         "cached_features",
         "dropped_features",
@@ -400,6 +436,7 @@ def write_history_csv(path, history):
         "velocity_norm",
         "velocity_limited",
         "velocity_scale",
+        "hard_limit_saturated",
         "translation_step",
         "rotation_step_deg",
         "raw_translation_step",
@@ -446,7 +483,6 @@ def write_history_csv(path, history):
                 "diff_max": item.get("diff_max", ""),
                 "diff_mean": item.get("diff_mean", ""),
                 "translation_gap": item.get("translation_gap", ""),
-                "gap_closed_pct": item.get("gap_closed_pct", ""),
                 "rotation_error_deg": item.get("rotation_error_deg", ""),
                 "cached_features": info.get("num_cached_features", ""),
                 "dropped_features": info.get("num_dropped_features", ""),
@@ -456,6 +492,7 @@ def write_history_csv(path, history):
                 "velocity_norm": info.get("velocity_norm", ""),
                 "velocity_limited": int(bool(item.get("velocity_limited", False))),
                 "velocity_scale": item.get("velocity_scale", ""),
+                "hard_limit_saturated": int(bool(item.get("hard_limit_saturated", False))),
                 "translation_step": item.get("translation_step", ""),
                 "rotation_step_deg": item.get("rotation_step_deg", ""),
                 "raw_translation_step": item.get("raw_translation_step", ""),
@@ -509,7 +546,6 @@ def history_for_json(history):
             "num_inliers": item.get("num_inliers"),
             "feature_mode": item.get("feature_mode"),
             "translation_gap": item.get("translation_gap"),
-            "gap_closed_pct": item.get("gap_closed_pct"),
             "rotation_error_deg": item.get("rotation_error_deg"),
             "visualization_path": item.get("visualization_path"),
             "diff_max": item.get("diff_max"),
@@ -543,21 +579,14 @@ def make_trial_name(start_index, target_index, depth_mode):
 
 
 def make_run_dir(controller, scene_name, renderer, start_index, target_index, depth_mode):
+    # The shared cross-trial index lives here; the run's details go directly
+    # under RUNS/ in the flat SCENE-RENDERER-CONTROLLER-DEPTH[-FEATUREMATCHER] folder.
     trial_dir = RUNS_ROOT / "servo_frames"
-    active_gain = GAIN_PHOTO if CONTROLLER != "ibvs" else GAIN_IBVS
-    run_tag = RUN_NAME or make_run_tag(active_gain, FEATURE_METHOD, RATIO)
-    output_dir = unique_run_root(
-        RUNS_ROOT,
-        "servo_frames",
-        [
-            scene_name,
-            renderer,
-            controller_short_name(controller),
-            depth_mode,
-            FEATURE_METHOD,
-            f"{int(start_index)}-to-{int(target_index)}",
-            run_tag,
-        ],
+    short = controller_short_name(controller)
+    # Feature matcher is only part of the name for feature-based servoing (FBVS).
+    matcher = FEATURE_METHOD if short == "ibvs" else None
+    output_dir = run_folder(
+        RUNS_ROOT, scene_name, short, depth_mode, matcher, renderer=renderer
     )
     return trial_dir, output_dir
 
@@ -578,7 +607,6 @@ TRIAL_INDEX_FIELDS = [
     "stop_reason",
     "initial_translation_gap",
     "final_translation_gap",
-    "translation_gap_closed_pct",
     "initial_rotation_error_deg",
     "final_rotation_error_deg",
 ]
@@ -621,7 +649,6 @@ def write_servo_summary_markdown(path, summary):
         ("Iterations", f"{summary['iterations_run']}/{summary['iterations']}"),
         ("Stop", summary["stop_reason"]),
         ("Translation gap", f"{format_stat(summary['initial_translation_gap'], 6)} -> {format_stat(summary['final_translation_gap'], 6)}"),
-        ("Gap closed", format_percent(summary["translation_gap_closed_pct"])),
         ("Rotation gap", f"{format_stat(summary['initial_rotation_error_deg'], 4)}deg -> {format_stat(summary['final_rotation_error_deg'], 4)}deg"),
     ]
     lines = [
@@ -683,6 +710,19 @@ def experiment_config(
             if MAX_INTERACTION_CONDITION is None
             else float(MAX_INTERACTION_CONDITION)
         ),
+        "max_translation_step": (
+            None if MAX_TRANSLATION_STEP is None else float(MAX_TRANSLATION_STEP)
+        ),
+        "max_rotation_step_deg": (
+            None if MAX_ROTATION_STEP_DEG is None else float(MAX_ROTATION_STEP_DEG)
+        ),
+        "hard_translation_step": (
+            None if HARD_TRANSLATION_STEP is None else float(HARD_TRANSLATION_STEP)
+        ),
+        "hard_rotation_step_deg": (
+            None if HARD_ROTATION_STEP_DEG is None else float(HARD_ROTATION_STEP_DEG)
+        ),
+        "adaptive_step_fraction": float(ADAPTIVE_STEP_FRACTION),
         "controller_kind": CONTROLLER,
         "sigma_blur": float(SIGMA_BLUR),
         "use_gzn": bool(USE_GZN),
@@ -694,7 +734,7 @@ def experiment_config(
 
 
 def run(args):
-    from controllers import IBVSController, PhotometricController
+    from controllers import IBVSController
     from experiment_config import (
         SERVO_FRAMES_CONFIG_KEYS,
         apply_config,
@@ -760,23 +800,7 @@ def run(args):
             max_interaction_condition=MAX_INTERACTION_CONDITION,
         )
     elif CONTROLLER == "photometric":
-        controller = PhotometricController(
-            scene=scene,
-            target_camera=target_camera,
-            gain=GAIN_PHOTO,
-            sigma_blur=SIGMA_BLUR,
-            use_gzn=USE_GZN,
-            grad_percentile=GRAD_PERCENTILE,
-            max_pixels=PHOTOMETRIC_MAX_PIXELS,
-            use_huber=USE_HUBER,
-            huber_k=HUBER_K,
-            use_intrinsic_depth=DEPTH_MODE == "intrinsic",
-            stop_mse_per_px=STOP_MSE_PER_PX,
-            stop_ssd=STOP_SSD,
-            min_interaction_rank=MIN_INTERACTION_RANK,
-            max_interaction_condition=MAX_INTERACTION_CONDITION,
-        )
-    elif CONTROLLER == "photometric_torch":
+        import torch
         controller = PhotometricControllerTorch(
             scene=scene,
             target_camera=target_camera,
@@ -793,6 +817,7 @@ def run(args):
             stop_ssd=STOP_SSD,
             min_interaction_rank=MIN_INTERACTION_RANK,
             max_interaction_condition=MAX_INTERACTION_CONDITION,
+            device="cuda" if torch.cuda.is_available() else "cpu",
         )
     else:
         raise ValueError(f"Unknown CONTROLLER={CONTROLLER!r}")
@@ -819,6 +844,13 @@ def run(args):
 
     initial_translation_gap = translation_gap(start_camera, target_camera)
     initial_rotation_error = rotation_error_deg(start_camera, target_camera)
+    motion_max_translation_step, motion_max_rotation_step_deg = adaptive_motion_limits(
+        initial_translation_gap,
+        initial_rotation_error,
+        max_translation_step=MAX_TRANSLATION_STEP,
+        max_rotation_step_deg=MAX_ROTATION_STEP_DEG,
+        adaptive_step_fraction=ADAPTIVE_STEP_FRACTION,
+    )
     target_T_world_cam = target_camera.T_world_cam.copy()
 
     def record_iteration_metrics(item):
@@ -832,22 +864,24 @@ def run(args):
         )
         item["translation_gap"] = translation_gap
         item["rotation_error_deg"] = rotation_error
-        closed_pct = gap_closed_percent(initial_translation_gap, translation_gap)
-        item["gap_closed_pct"] = closed_pct
 
         info = item.get("controller_info", {})
-        err_label, err_value = controller_error_display(info)
+        _, err_value = controller_error_display(info)
         inliers = info.get("num_inlier_matches", 0)
-        print(
-            f"it={item['iteration']:04d} "
+        ident = color(f"it={item['iteration']:04d}", "cyan")
+        state = (
             f"ok={int(bool(item.get('step_accepted', False)))} "
-            f"mode={info.get('feature_mode', '-')} "
-            f"{err_label}={err_value} "
+            f"mode={info.get('feature_mode', '-')}"
+        )
+        err_str = color(f"Error={err_value}", "yellow")
+        gap_str = color(
             f"t_gap={format_stat(translation_gap, 6)} "
-            f"rot_gap={format_stat(rotation_error, 3)}deg "
-            f"closed={format_percent(closed_pct)} "
-            f"inliers={inliers} "
-            f"stop={short_stop_reason(item.get('stop_reason'))}"
+            f"rot_gap={format_stat(rotation_error, 3)}deg",
+            "blue",
+        )
+        print(
+            f"{ident} {state} {err_str} {gap_str} "
+            f"inliers={inliers}"
         )
 
     result = run_servo_loop(
@@ -862,13 +896,17 @@ def run(args):
         feature_method=FEATURE_METHOD,
         iteration_callback=record_iteration_metrics,
         viz_iter=VIZ_ITER,
+        max_translation_step=motion_max_translation_step,
+        max_rotation_step_deg=motion_max_rotation_step_deg,
+        hard_translation_step=HARD_TRANSLATION_STEP,
+        hard_rotation_step_deg=HARD_ROTATION_STEP_DEG,
     )
 
     final_camera = result["camera"]
     final_render = result["rendered"]
     save_rgb(output_dir / "final_render.png", final_render)
     final_photometric_viz = {}
-    if CONTROLLER in ("photometric", "photometric_torch"):
+    if CONTROLLER == "photometric":
         final_photometric_viz = save_current_desired_error_visualization(
             final_render,
             target_image,
@@ -928,12 +966,13 @@ def run(args):
             "visualization_path",
         ),
         "depth_preflight": depth_preflight_info,
+        "motion_max_translation_step": motion_max_translation_step,
+        "motion_max_rotation_step_deg": motion_max_rotation_step_deg,
+        "hard_translation_step": HARD_TRANSLATION_STEP,
+        "hard_rotation_step_deg": HARD_ROTATION_STEP_DEG,
+        "adaptive_step_fraction": float(ADAPTIVE_STEP_FRACTION),
         "initial_translation_gap": initial_translation_gap,
         "final_translation_gap": final_translation_gap,
-        "translation_gap_closed_pct": gap_closed_percent(
-            initial_translation_gap,
-            final_translation_gap,
-        ),
         "initial_rotation_error_deg": initial_rotation_error,
         "final_rotation_error_deg": final_rotation_error,
         "iterations_run": len(result["history"]),
@@ -991,10 +1030,6 @@ def run(args):
         "render_ms_mean": float(result.get("timing", {}).get("render_ms_mean", 0.0)),
         "initial_translation_gap": initial_translation_gap,
         "final_translation_gap": final_translation_gap,
-        "translation_gap_closed_pct": gap_closed_percent(
-            initial_translation_gap,
-            final_translation_gap,
-        ),
         "initial_rotation_error_deg": initial_rotation_error,
         "final_rotation_error_deg": final_rotation_error,
     })
@@ -1002,25 +1037,33 @@ def run(args):
     last = result["history"][-1] if result["history"] else {}
     info = last.get("controller_info", {})
     timing = result.get("timing", {})
-    print(
+    header = color(
         f"Servo {controller_name} {RENDERER}: index {start_index} -> {target_index} "
-        f"({start_frame} -> {target_frame}), "
-        f"depth={DEPTH_MODE}, "
-        f"iterations={len(result['history'])}/{ITERATIONS}, "
-        f"stop={result['stop_reason']}, "
+        f"({start_frame} -> {target_frame})",
+        "cyan",
+    )
+    timing_str = color(
         f"fps={timing.get('fps', 0.0):.1f} "
         f"(iter_ms={timing.get('iter_ms_mean', 0.0):.2f}, "
         f"render_ms={timing.get('render_ms_mean', 0.0):.2f}, "
-        f"ctrl_ms={timing.get('controller_ms_mean', 0.0):.2f})"
+        f"ctrl_ms={timing.get('controller_ms_mean', 0.0):.2f})",
+        "magenta",
     )
     print(
+        f"{header}, depth={DEPTH_MODE}, "
+        f"iterations={len(result['history'])}/{ITERATIONS}, "
+        f"{timing_str}"
+    )
+    print(color(
         f"Translation gap: {format_stat(initial_translation_gap, 6)} -> "
-        f"{format_stat(final_translation_gap, 6)}"
-    )
-    print(
+        f"{format_stat(final_translation_gap, 6)}",
+        "blue",
+    ))
+    print(color(
         f"Rotation gap: {format_stat(initial_rotation_error, 4)}deg -> "
-        f"{format_stat(final_rotation_error, 4)}deg"
-    )
+        f"{format_stat(final_rotation_error, 4)}deg",
+        "blue",
+    ))
     if info:
         print(
             f"Last iteration: {info['num_inlier_matches']} controller inliers, "

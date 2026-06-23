@@ -20,21 +20,32 @@ class FeatureMatcher:
         else:
             raise ValueError(f"Unknown method: {method!r}")
         self.method = method
+        self._target_image = None
+        self._target_features = None
+
+    def clear_target_cache(self):
+        self._target_image = None
+        self._target_features = None
+
 
     def match(self, img1, img2):
         """Return paired keypoint arrays (kpts1, kpts2), each (N, 2) float32."""
-        im1_u8 = (img1 * 255.0).clip(0, 255).astype(np.uint8)
-        im2_u8 = (img2 * 255.0).clip(0, 255).astype(np.uint8)
+        im1_u8 = (np.asarray(img1) * 255.0).clip(0, 255).astype(np.uint8)
 
         if self.method == 'xfeat':
-            return self._match_xfeat(im1_u8, im2_u8)
+            return self._match_xfeat(im1_u8, img2)
 
-        # SIFT
         gray1 = cv2.cvtColor(im1_u8, cv2.COLOR_RGB2GRAY)
-        gray2 = cv2.cvtColor(im2_u8, cv2.COLOR_RGB2GRAY)
-
         kp1, des1 = self.extractor.detectAndCompute(gray1, None)
-        kp2, des2 = self.extractor.detectAndCompute(gray2, None)
+
+        if self._target_image is img2 and self._target_features is not None:
+            kp2, des2 = self._target_features
+        else:
+            im2_u8 = (np.asarray(img2) * 255.0).clip(0, 255).astype(np.uint8)
+            gray2 = cv2.cvtColor(im2_u8, cv2.COLOR_RGB2GRAY)
+            kp2, des2 = self.extractor.detectAndCompute(gray2, None)
+            self._target_image = img2
+            self._target_features = (kp2, des2)
 
         if des1 is None or des2 is None or len(kp1) == 0 or len(kp2) == 0:
             empty = np.zeros((0, 2), dtype=np.float32)
@@ -57,19 +68,35 @@ class FeatureMatcher:
         kpts2 = pts2_all[train_idx].astype(np.float32, copy=False)
         return kpts1, kpts2
 
-    def _match_xfeat(self, im1_u8, im2_u8):
+    def _extract_xfeat(self, image_u8):
+        parsed = self.extractor.parse_input(image_u8)
+        return self.extractor.detectAndCompute(parsed)[0]
+
+    def _match_xfeat(self, im1_u8, target):
         try:
-            kpts1, kpts2 = self.extractor.match_xfeat(im1_u8, im2_u8)
+            return self._match_xfeat_impl(im1_u8, target)
         except RuntimeError as exc:
             if not self._can_retry_xfeat_on_cpu(exc):
                 raise
+            self.clear_target_cache()
             self.extractor.dev = torch.device('cpu')
             self.extractor.net.to(self.extractor.dev)
-            kpts1, kpts2 = self.extractor.match_xfeat(im1_u8, im2_u8)
+            return self._match_xfeat_impl(im1_u8, target)
 
-        kpts1 = np.asarray(kpts1, dtype=np.float32).reshape(-1, 2)
-        kpts2 = np.asarray(kpts2, dtype=np.float32).reshape(-1, 2)
-        return kpts1, kpts2
+    def _match_xfeat_impl(self, im1_u8, target):
+        out1 = self._extract_xfeat(im1_u8)
+        if self._target_image is target and self._target_features is not None:
+            out2 = self._target_features
+        else:
+            im2_u8 = (np.asarray(target) * 255.0).clip(0, 255).astype(np.uint8)
+            out2 = self._extract_xfeat(im2_u8)
+            self._target_image = target
+            self._target_features = out2
+
+        idxs0, idxs1 = self.extractor.match(out1['descriptors'], out2['descriptors'], min_cossim=-1)
+        kpts1 = out1['keypoints'][idxs0].cpu().numpy()
+        kpts2 = out2['keypoints'][idxs1].cpu().numpy()
+        return kpts1.astype(np.float32, copy=False), kpts2.astype(np.float32, copy=False)
 
     def _can_retry_xfeat_on_cpu(self, exc):
         if getattr(self.extractor, 'dev', None) == torch.device('cpu'):

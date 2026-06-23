@@ -176,8 +176,24 @@ class GSScene:
         # Static per-render buffer that never changes across calls.
         self._means2D = torch.zeros_like(self.xyz)
         self._bg = torch.zeros(3, device='cuda')
+        self._depth_colors = torch.empty_like(self.xyz)
+        self._depth_colors[:, 2] = 1.0
         self._proj_cache = {}
         self._last_camera = None
+        self._last_depth_key = None
+        self._last_depth = None
+
+    @staticmethod
+    def _camera_key(camera):
+        return (
+            camera.W,
+            camera.H,
+            camera.fx,
+            camera.fy,
+            camera.cx,
+            camera.cy,
+            camera.T_world_cam.tobytes(),
+        )
 
     def _get_proj(self, fx, fy, cx, cy, W, H):
         key = (fx, fy, cx, cy, W, H)
@@ -192,7 +208,8 @@ class GSScene:
             self._proj_cache[key] = proj
         return proj
 
-    def render(self, camera):
+    def render_tensor(self, camera):
+        """Render an HWC float32 image on CUDA without a host readback."""
         self._last_camera = camera
 
         # tan(fov/2) values are used by the rasterizer to recover focal lengths
@@ -238,25 +255,32 @@ class GSScene:
 
         rasterizer = GaussianRasterizer(raster_settings)
 
-        outputs = rasterizer(
-            means3D=self.xyz,
-            means2D=self._means2D,
-            shs=self._shs,
-            opacities=self.opacities,
-            scales=self.scales,
-            rotations=self.rotations,
-            colors_precomp=None
-        )
+        with torch.inference_mode():
+            outputs = rasterizer(
+                means3D=self.xyz,
+                means2D=self._means2D,
+                shs=self._shs,
+                opacities=self.opacities,
+                scales=self.scales,
+                rotations=self.rotations,
+                colors_precomp=None
+            )
         rendered_image = outputs[0]
 
-        rendered_image = rendered_image.permute(1, 2, 0).clamp(0, 1)
-        return rendered_image.cpu().numpy()
+        return rendered_image.permute(1, 2, 0).clamp(0, 1)
+
+    def render(self, camera):
+        return self.render_tensor(camera).cpu().numpy()
 
     def render_depth(self, camera=None):
         if camera is None:
             camera = self._last_camera
         if camera is None:
             raise NotImplementedError("GSScene.render_depth requires a camera")
+
+        depth_key = self._camera_key(camera)
+        if depth_key == self._last_depth_key:
+            return self._last_depth.copy()
 
         tanfovx = camera.W / (2.0 * camera.fx)
         tanfovy = camera.H / (2.0 * camera.fy)
@@ -297,24 +321,28 @@ class GSScene:
 
         rasterizer = GaussianRasterizer(raster_settings)
 
-        ones = torch.ones((self.xyz.shape[0], 1), dtype=self.xyz.dtype, device=self.xyz.device)
-        xyz_h = torch.cat([self.xyz, ones], dim=1)
-        z_cam = (xyz_h @ T_cam_world.T)[:, 2:3]
-        depth_colors = torch.cat([z_cam, z_cam, ones], dim=1)
+        z_cam = self.xyz @ T_cam_world[2, :3] + T_cam_world[2, 3]
+        self._depth_colors[:, 0].copy_(z_cam)
+        self._depth_colors[:, 1].copy_(z_cam)
+        depth_colors = self._depth_colors
 
-        outputs = rasterizer(
-            means3D=self.xyz,
-            means2D=self._means2D,
-            shs=None,
-            opacities=self.opacities,
-            scales=self.scales,
-            rotations=self.rotations,
-            colors_precomp=depth_colors
-        )
+        with torch.inference_mode():
+            outputs = rasterizer(
+                means3D=self.xyz,
+                means2D=self._means2D,
+                shs=None,
+                opacities=self.opacities,
+                scales=self.scales,
+                rotations=self.rotations,
+                colors_precomp=depth_colors
+            )
         depth_numerator = outputs[0][0]
         accum_alpha = outputs[0][2]
         rendered_depth = torch.zeros_like(depth_numerator)
         valid = accum_alpha > 1e-6
         rendered_depth[valid] = depth_numerator[valid] / accum_alpha[valid]
 
-        return rendered_depth.detach().cpu().numpy().astype(np.float32, copy=False)
+        depth = rendered_depth.detach().cpu().numpy().astype(np.float32, copy=False)
+        self._last_depth_key = depth_key
+        self._last_depth = depth
+        return depth.copy()

@@ -2,6 +2,17 @@ import numpy as np
 from pathlib import Path
 from camera import Camera
 
+IMAGE_DIR_NAMES = ("images", "data")
+
+
+def _resolve_image_path(scene_dir, image_name):
+    for image_dir_name in IMAGE_DIR_NAMES:
+        rgb_path = scene_dir / image_dir_name / image_name
+        if rgb_path.is_file():
+            return rgb_path
+    return None
+
+
 def load_colmap(scene_dir):
     import pycolmap
     import sys
@@ -41,9 +52,10 @@ def load_colmap(scene_dir):
         T_cam_world[:3, :4] = image.cam_from_world().matrix()
         T_world_cam = np.linalg.inv(T_cam_world)
 
-        # COLMAP image names are relative to the reconstruction's images/ dir.
-        rgb_path = scene_dir / "images" / image.name
-        if not rgb_path.is_file():
+        # COLMAP image names are usually relative to images/, but Replica-style
+        # scenes in this repo store RGB/depth/pose triples under data/.
+        rgb_path = _resolve_image_path(scene_dir, image.name)
+        if rgb_path is None:
             skipped.append(image.name)
             continue
 
@@ -53,9 +65,10 @@ def load_colmap(scene_dir):
     if skipped:
         preview = ", ".join(skipped[:5])
         more = f" (+{len(skipped) - 5} more)" if len(skipped) > 5 else ""
+        searched = ", ".join(str(scene_dir / name) for name in IMAGE_DIR_NAMES)
         print(
             f"[load_colmap] skipped {len(skipped)} registered image(s) with "
-            f"missing files under {scene_dir / 'images'}: {preview}{more}",
+            f"missing files under {searched}: {preview}{more}",
             file=sys.stderr,
         )
     return data

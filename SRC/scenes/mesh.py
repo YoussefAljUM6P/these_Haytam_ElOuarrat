@@ -20,6 +20,20 @@ class MeshScene:
         self._cam_node = None
         self._cam_intrinsics_key = None
         self._last_camera = None
+        self._last_render_key = None
+        self._last_depth = None
+
+    @staticmethod
+    def _camera_key(camera):
+        return (
+            camera.W,
+            camera.H,
+            camera.fx,
+            camera.fy,
+            camera.cx,
+            camera.cy,
+            camera.T_world_cam.tobytes(),
+        )
 
     def _get_renderer(self, W, H):
         if self._renderer is None or self._renderer_size != (W, H):
@@ -50,7 +64,9 @@ class MeshScene:
         T_world_cam_gl = camera.T_world_cam @ _CV_TO_GL
         self._get_cam_node(camera, T_world_cam_gl)
         renderer = self._get_renderer(camera.W, camera.H)
-        color, _ = renderer.render(self.scene, flags=pyrender.RenderFlags.NONE)
+        color, depth = renderer.render(self.scene, flags=pyrender.RenderFlags.NONE)
+        self._last_render_key = self._camera_key(camera)
+        self._last_depth = depth.astype(np.float32, copy=False)
         return (color / 255.0).astype(np.float32)
 
     def render_depth(self, camera=None):
@@ -59,11 +75,17 @@ class MeshScene:
         if camera is None:
             raise NotImplementedError("MeshScene.render_depth requires a camera")
 
+        key = self._camera_key(camera)
+        if self._last_render_key == key and self._last_depth is not None:
+            return self._last_depth.copy()
+
         T_world_cam_gl = camera.T_world_cam @ _CV_TO_GL
         self._get_cam_node(camera, T_world_cam_gl)
         renderer = self._get_renderer(camera.W, camera.H)
         _, depth = renderer.render(self.scene, flags=pyrender.RenderFlags.NONE)
-        return depth.astype(np.float32)
+        self._last_render_key = key
+        self._last_depth = depth.astype(np.float32, copy=False)
+        return self._last_depth.copy()
 
     def __del__(self):
         try:

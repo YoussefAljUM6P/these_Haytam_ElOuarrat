@@ -242,7 +242,7 @@ def render_missing_scene_visuals(
             task_index=task_index,
             target_frame=target_frame,
         )
-        if controller in ("photometric", "photometric_torch"):
+        if controller == "photometric":
             save_current_desired_error_visualization(
                 rendered,
                 target_image,

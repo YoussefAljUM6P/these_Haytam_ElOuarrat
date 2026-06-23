@@ -12,11 +12,14 @@ Use via the CLI:
 
 import csv
 import json
+import sys
 import traceback
 from pathlib import Path
 
 from run_layout import (
-    unique_run_root,
+    color,
+    run_folder,
+    run_folder_name,
     write_command,
     write_json as write_run_json,
     write_run_readme,
@@ -26,15 +29,13 @@ from runners.servo_frames import (
     RUNS_ROOT,
     camera_metadata,
     controller_error_display,
+    adaptive_motion_limits,
     depth_preflight,
-    format_percent,
     format_stat,
-    gap_closed_percent,
     frame_id_from_path,
     needs_intrinsic_depth_preflight,
     load_rgb,
     rotation_error_from_pose,
-    short_stop_reason,
     sorted_frame_ids,
     translation_error_from_pose,
 )
@@ -46,6 +47,7 @@ from runners.servo_frames import (
 
 DATASETS = ["living"]
 RENDERER = "gs"
+GS_MODEL = "standard"  # "standard" -> gs.ply, "moge" -> gs_moge.ply
 NERF_RENDER_SCALE = 0.25
 STRIDE = 1
 MINI_ITERATIONS = 10
@@ -59,14 +61,33 @@ MIN_FEATURES = 3
 RATIO = 1
 START_INDEX = 1
 MAX_PAIRS = None
+# Split the capture into "takes" (smooth passes separated by camera teleports)
+# and run them back-to-back as one trajectory: at each take boundary the camera
+# resets to the GT pose of that take's first frame instead of servoing across
+# the jump. Still one run, one TUM pair, one evo evaluation. See SRC/takes.py.
+USE_TAKES = True
+TAKES_JUMP_FACTOR = 5.0
 STOP_RESIDUAL_PX = 0.5      # IBVS: RMS reprojection error (px)
 STOP_MSE_PER_PX = 2.0e-6    # legacy photometric MSE; used when STOP_SSD is None
 STOP_SSD = None             # photometric: ViSP-style SSD threshold, or None
+# Per-task divergence abort thresholds (checked on the final residual).
+DIVERGE_RESIDUAL_PX = 1000.0  # IBVS: feature error (px) above which a task is "diverged"
+DIVERGE_MSE_PER_PX = 0.01     # photometric: image MSE/px above which a task is "diverged"
 MIN_INTERACTION_RANK = 6
 MAX_INTERACTION_CONDITION = 1.0e8
+MAX_TRANSLATION_STEP = 0.5
+MAX_ROTATION_STEP_DEG = 30.0
+HARD_TRANSLATION_STEP = 5.0
+HARD_ROTATION_STEP_DEG = 180.0
+ADAPTIVE_STEP_FRACTION = 0.25
+CONTINUE_ON_TASK_FAILURE = False
 RPE_DELTA = 1
 SAVE_TASK_VIZ = True
 TASK_VIZ_EVERY = 1
+# Live per-iteration progress shown in the terminal while each mini-task runs
+# (iter NNN/MMM ...), updated in place. "auto" => only when stdout is a TTY, so
+# redirected logs keep just the final per-task lines. True forces it, False off.
+SHOW_STEP_PROGRESS = "auto"
 
 # Dynamic iteration schedule for IBVS launches (paper eq. 7):
 #     N(w) = N1                if w > 1
@@ -75,6 +96,17 @@ TASK_VIZ_EVERY = 1
 # where w(i) = ||n_r_i - n_q_i||_2 / ||n_r_1 - n_q_1||_2 over filtered
 # correspondences (pixels). Disabled for non-IBVS controllers.
 DYNAMIC_IBVS_ITERS = True
+
+
+def _show_step_progress() -> bool:
+    """Whether to print the live per-iteration progress line.
+
+    ``SHOW_STEP_PROGRESS`` is "auto" (only on an interactive TTY, so redirected
+    cluster logs keep just the final per-task lines), True (always) or False.
+    """
+    if SHOW_STEP_PROGRESS == "auto":
+        return sys.stdout.isatty()
+    return bool(SHOW_STEP_PROGRESS)
 
 
 def _dynamic_n_iter(w: float, n1: int) -> int:
@@ -123,6 +155,33 @@ def add_arguments(parser):
             "Resume an interrupted run. With no value, auto-picks the most "
             "recent run dir matching the current tag. Pass a path to target a "
             "specific run dir."
+        ),
+    )
+    parser.add_argument(
+        "--diverge-mse-per-px",
+        type=float,
+        default=None,
+        help=(
+            "Photometric trajectory abort threshold on final image MSE per pixel. "
+            "Overrides config/--set diverge_mse_per_px."
+        ),
+    )
+    parser.add_argument(
+        "--diverge-residual-px",
+        type=float,
+        default=None,
+        help=(
+            "IBVS trajectory abort threshold on final feature residual in pixels. "
+            "Overrides config/--set diverge_residual_px."
+        ),
+    )
+    parser.add_argument(
+        "--continue-on-task-failure",
+        action="store_true",
+        default=None,
+        help=(
+            "When a mini-task fails or diverges, record a cut to its desired "
+            "pose and continue with the next task instead of aborting."
         ),
     )
 
@@ -181,17 +240,35 @@ def scale_frame_records(records, scale):
     return scaled
 
 
-def build_trajectory_tasks(frame_ids):
+def build_trajectory_tasks(frame_ids, takes=None):
+    """Chained servo tasks, optionally partitioned into takes.
+
+    ``takes`` is a list of frame-id lists (one per capture pass); pass None for
+    the legacy single-sequence behavior. The first task of every take is marked
+    ``reset`` so the runner starts it from the GT pose of that take's first
+    frame rather than chaining across the camera jump. ``START_INDEX`` offsets
+    into the first segment; ``MAX_PAIRS`` caps the total task count.
+    """
+    if takes:
+        segments = [list(take) for take in takes]
+    else:
+        segments = [list(frame_ids)]
+
     start_pos = max(0, int(START_INDEX) - 1)
+    if segments and start_pos:
+        segments[0] = segments[0][start_pos:]
+
     tasks = []
-    for src_pos in range(start_pos, len(frame_ids) - STRIDE, STRIDE):
-        tasks.append({
-            "src_frame": frame_ids[src_pos],
-            "target_frame": frame_ids[src_pos + STRIDE],
-            "reset": False,
-        })
-    if tasks:
-        tasks[0]["reset"] = True
+    for segment in segments:
+        first_task = len(tasks)
+        for src_pos in range(0, len(segment) - STRIDE, STRIDE):
+            tasks.append({
+                "src_frame": segment[src_pos],
+                "target_frame": segment[src_pos + STRIDE],
+                "reset": False,
+            })
+        if len(tasks) > first_task:
+            tasks[first_task]["reset"] = True
 
     if MAX_PAIRS is not None:
         tasks = tasks[: int(MAX_PAIRS)]
@@ -212,7 +289,12 @@ def load_trajectory_scene_and_frames(scene_dir):
         scene = MeshScene(mesh_path)
     elif RENDERER == "gs":
         from scenes.gs import GSScene
-        scene = GSScene(scene_dir / "gs.ply")
+        ply_path = scene_dir / ("gs_moge.ply" if GS_MODEL == "moge" else "gs.ply")
+        if not ply_path.exists():
+            raise FileNotFoundError(f"GS model not found: {ply_path}")
+        if GS_MODEL == "moge":
+            print(f"Using MoGe depth-supervised GS {ply_path}")
+        scene = GSScene(ply_path)
     elif RENDERER == "nerf":
         records = scale_frame_records(records, NERF_RENDER_SCALE)
         if float(NERF_RENDER_SCALE) != 1.0:
@@ -399,12 +481,19 @@ PER_TASK_FIELDS = [
     "feature_err_px",
     "final_residual",
     "diverged",
+    "cut_to_desired",
+    "failure_type",
+    "failure_message",
     "stop_reason",
     "depth_valid_pixels",
     "depth_finite_ratio",
     "initial_translation_gap",
+    "initial_rotation_gap_deg",
+    "motion_max_translation_step",
+    "motion_max_rotation_step_deg",
+    "pre_cut_translation_gap",
+    "pre_cut_rotation_error_deg",
     "translation_gap",
-    "gap_closed_pct",
     "rotation_error_deg",
     "fps",
     "render_fps",
@@ -579,18 +668,14 @@ def write_trajectory_summary_markdown(path, overall):
 
 
 def trajectory_scene_dir(run_root, scene_name, resume=False):
-    run_root = Path(run_root)
-    new_dir = run_root / "scenes" / scene_name
-    old_dir = run_root / scene_name
-    if resume and old_dir.exists() and not new_dir.exists():
-        return old_dir
-    return new_dir
+    # Flat layout: each scene's run folder holds its artifacts directly.
+    return Path(run_root)
 
 
-def trajectory_run_parts(tag):
-    dataset_part = DATASETS[0] if len(DATASETS) == 1 else f"all{len(DATASETS)}"
-    method = FEATURE_METHOD if CONTROLLER == "ibvs" else CONTROLLER
-    return [dataset_part, RENDERER, CONTROLLER, DEPTH_MODE, method, tag]
+def trajectory_feature_matcher():
+    # Only feature-based servoing (FBVS / IBVS) carries a feature matcher in the
+    # run-folder name; photometric controllers don't.
+    return FEATURE_METHOD if CONTROLLER == "ibvs" else None
 
 
 def resolved_trajectory_config(tag, run_root):
@@ -613,15 +698,33 @@ def resolved_trajectory_config(tag, run_root):
         "ratio": int(RATIO),
         "start_index": int(START_INDEX),
         "max_pairs": MAX_PAIRS,
+        "use_takes": bool(USE_TAKES),
+        "takes_jump_factor": float(TAKES_JUMP_FACTOR),
         "stop_residual_px": float(STOP_RESIDUAL_PX),
         "stop_mse_per_px": float(STOP_MSE_PER_PX),
         "stop_ssd": None if STOP_SSD is None else float(STOP_SSD),
+        "diverge_residual_px": float(DIVERGE_RESIDUAL_PX),
+        "diverge_mse_per_px": float(DIVERGE_MSE_PER_PX),
         "min_interaction_rank": int(MIN_INTERACTION_RANK),
         "max_interaction_condition": (
             None
             if MAX_INTERACTION_CONDITION is None
             else float(MAX_INTERACTION_CONDITION)
         ),
+        "max_translation_step": (
+            None if MAX_TRANSLATION_STEP is None else float(MAX_TRANSLATION_STEP)
+        ),
+        "max_rotation_step_deg": (
+            None if MAX_ROTATION_STEP_DEG is None else float(MAX_ROTATION_STEP_DEG)
+        ),
+        "hard_translation_step": (
+            None if HARD_TRANSLATION_STEP is None else float(HARD_TRANSLATION_STEP)
+        ),
+        "hard_rotation_step_deg": (
+            None if HARD_ROTATION_STEP_DEG is None else float(HARD_ROTATION_STEP_DEG)
+        ),
+        "adaptive_step_fraction": float(ADAPTIVE_STEP_FRACTION),
+        "continue_on_task_failure": bool(CONTINUE_ON_TASK_FAILURE),
         "rpe_delta": int(RPE_DELTA),
         "save_task_viz": bool(SAVE_TASK_VIZ),
         "task_viz_every": int(TASK_VIZ_EVERY),
@@ -635,37 +738,24 @@ def resolved_trajectory_config(tag, run_root):
     }
 
 
-def _trajectory_has_progress(run_root):
-    return any(
-        (trajectory_scene_dir(run_root, scene_name) / "per_task_errors.csv").exists()
-        or (trajectory_scene_dir(run_root, scene_name, resume=True) / "per_task_errors.csv").exists()
-        for scene_name in DATASETS
+def find_latest_resumable_run(scene_name, renderer, controller, depth, feature_matcher):
+    """Latest flat run folder for this exact config that has progress to resume.
+
+    Matches RUNS/<NAME> and its '-NN' collision variants, where NAME is the
+    SCENE-RENDERER-CONTROLLER-DEPTH[-FEATUREMATCHER] folder name.
+    """
+    name = run_folder_name(
+        scene_name, controller, depth, feature_matcher, renderer=renderer
     )
-
-
-def _iter_trajectory_run_roots(renderer):
-    base = RUNS_ROOT / "trajectory"
-    if not base.exists():
-        return []
-
-    roots = []
-    for entry in base.iterdir():
-        if not entry.is_dir():
-            continue
-        if entry.name == renderer:
-            roots.extend(path for path in entry.iterdir() if path.is_dir())
-        elif entry.name not in {"mesh", "gs", "nerf"}:
-            roots.append(entry)
-    return roots
-
-
-def find_latest_resumable_run(renderer, tag):
-    candidates = []
-    for entry in _iter_trajectory_run_roots(renderer):
-        if f"_{tag}" not in entry.name:
-            continue
-        if _trajectory_has_progress(entry):
-            candidates.append(entry)
+    if not RUNS_ROOT.exists():
+        return None
+    candidates = [
+        entry
+        for entry in RUNS_ROOT.iterdir()
+        if entry.is_dir()
+        and (entry.name == name or entry.name.startswith(name + "-"))
+        and (entry / "per_task_errors.csv").exists()
+    ]
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
@@ -674,14 +764,11 @@ def find_latest_resumable_run(renderer, tag):
 def run_scene(scene_name, run_root, resume=False):
     import numpy as np
 
-    from controllers import IBVSController, PhotometricController
+    from controllers import IBVSController
     from features import FeatureMatcher
     from photometric import PhotometricControllerTorch
     from servo import copy_camera_with_pose, run_servo_loop
     from viz import save_current_desired_error_visualization, save_side_by_side
-
-    DIVERGE_RESIDUAL_PX = 1000.0
-    DIVERGE_MSE_PER_PX = 0.01
 
     def _residual(rendered, target, camera):
         if CONTROLLER == "ibvs" and isinstance(controller, IBVSController):
@@ -712,12 +799,21 @@ def run_scene(scene_name, run_root, resume=False):
 
     scene, frame_index = load_trajectory_scene_and_frames(scene_dir)
     frame_ids = sorted_frame_ids(frame_index)
-    tasks = build_trajectory_tasks(frame_ids)
+
+    takes = None
+    if USE_TAKES:
+        from takes import ensure_takes
+        takes = ensure_takes(
+            scene_dir, frame_index, jump_factor=TAKES_JUMP_FACTOR
+        )
+
+    tasks = build_trajectory_tasks(frame_ids, takes)
     if not tasks:
         raise RuntimeError(
             f"{scene_name}: no valid frame pairs at stride {STRIDE} "
             f"from START_INDEX={START_INDEX}"
         )
+    num_takes = len(takes) if takes else 1
 
     initial_frame = frame_index[tasks[0]["src_frame"]]
     initial_camera = initial_frame["camera"]
@@ -736,23 +832,7 @@ def run_scene(scene_name, run_root, resume=False):
             max_interaction_condition=MAX_INTERACTION_CONDITION,
         )
     elif CONTROLLER == "photometric":
-        controller = PhotometricController(
-            scene=scene,
-            target_camera=None,
-            gain=GAIN_PHOTO,
-            sigma_blur=SIGMA_BLUR,
-            use_gzn=USE_GZN,
-            grad_percentile=GRAD_PERCENTILE,
-            max_pixels=PHOTOMETRIC_MAX_PIXELS,
-            use_huber=USE_HUBER,
-            huber_k=HUBER_K,
-            use_intrinsic_depth=(DEPTH_MODE == "intrinsic"),
-            stop_mse_per_px=STOP_MSE_PER_PX,
-            stop_ssd=STOP_SSD,
-            min_interaction_rank=MIN_INTERACTION_RANK,
-            max_interaction_condition=MAX_INTERACTION_CONDITION,
-        )
-    elif CONTROLLER == "photometric_torch":
+        import torch
         controller = PhotometricControllerTorch(
             scene=scene,
             target_camera=None,
@@ -769,6 +849,7 @@ def run_scene(scene_name, run_root, resume=False):
             stop_ssd=STOP_SSD,
             min_interaction_rank=MIN_INTERACTION_RANK,
             max_interaction_condition=MAX_INTERACTION_CONDITION,
+            device="cuda" if torch.cuda.is_available() else "cpu",
         )
     else:
         raise ValueError(f"Unknown CONTROLLER={CONTROLLER!r}")
@@ -841,12 +922,23 @@ def run_scene(scene_name, run_root, resume=False):
             current_camera.W,
             current_camera.H,
         )
-        if isinstance(controller, (PhotometricController, PhotometricControllerTorch)):
+        if isinstance(controller, PhotometricControllerTorch):
             controller.set_target_camera(target_camera)
 
         initial_translation_gap = translation_error_from_pose(
             current_camera.T_world_cam,
             target_camera.T_world_cam,
+        )
+        initial_rotation_gap = rotation_error_from_pose(
+            current_camera.T_world_cam,
+            target_camera.T_world_cam,
+        )
+        motion_max_translation_step, motion_max_rotation_step_deg = adaptive_motion_limits(
+            initial_translation_gap,
+            initial_rotation_gap,
+            max_translation_step=MAX_TRANSLATION_STEP,
+            max_rotation_step_deg=MAX_ROTATION_STEP_DEG,
+            adaptive_step_fraction=ADAPTIVE_STEP_FRACTION,
         )
 
         # Paper eq. 7: dynamically choose iter count for this IBVS launch.
@@ -864,6 +956,27 @@ def run_scene(scene_name, run_root, resume=False):
             else:
                 dynamic_w = feature_err_px / baseline_feature_err_px
             iters_for_task = _dynamic_n_iter(dynamic_w, MINI_ITERATIONS)
+
+        step_callback = None
+        if _show_step_progress():
+            pair_tag = f"[{scene_name}] task={task_idx:04d} {src_frame_id}->{tgt_frame_id}"
+
+            def step_callback(item, _target_T=target_camera.T_world_cam,
+                              _init_gap=initial_translation_gap, _tag=pair_tag,
+                              _total=iters_for_task):
+                # In-place, ephemeral progress line: overwritten each iteration
+                # (\r + clear-to-EOL) and never written to the run logs.
+                it = int(item["iteration"]) + 1
+                t_gap = translation_error_from_pose(item["T_world_cam"], _target_T)
+                info = item.get("controller_info", {})
+                _, err_value = controller_error_display(info)
+                sys.stdout.write(
+                    f"\r\033[K{_tag} iter{it:03d}/{_total:03d} "
+                    f"Error={err_value} "
+                    f"t_gap={format_stat(t_gap, 6)}"
+                )
+                sys.stdout.flush()
+                return False
 
         depth_preflight_info = None
         try:
@@ -885,17 +998,18 @@ def run_scene(scene_name, run_root, resume=False):
                 visualization_dir=None,
                 matcher=matcher,
                 feature_method=FEATURE_METHOD,
-                iteration_callback=None,
+                iteration_callback=step_callback,
                 viz_iter=0,
+                max_translation_step=motion_max_translation_step,
+                max_rotation_step_deg=motion_max_rotation_step_deg,
+                hard_translation_step=HARD_TRANSLATION_STEP,
+                hard_rotation_step_deg=HARD_ROTATION_STEP_DEG,
             )
         except Exception as e:
+            if step_callback is not None:
+                sys.stdout.write("\r\033[K")
+                sys.stdout.flush()
             traceback.print_exc()
-            print(
-                f"[{scene_name}] task {task_idx:04d} FAILED ({type(e).__name__}: {e}); "
-                f"aborting scene. Last successful task: "
-                f"{per_task_rows[-1]['task_index'] if per_task_rows else 'none'}. "
-                f"Proceeding to evaluation on completed tasks."
-            )
             failure_info = {
                 "task_index": int(task_idx),
                 "src_frame": src_frame_id,
@@ -908,7 +1022,78 @@ def run_scene(scene_name, run_root, resume=False):
                     json.dump(failure_info, f, indent=2)
             except OSError:
                 pass
-            break
+
+            if not CONTINUE_ON_TASK_FAILURE:
+                print(
+                    f"[{scene_name}] task {task_idx:04d} FAILED ({type(e).__name__}: {e}); "
+                    f"aborting scene. Last successful task: "
+                    f"{per_task_rows[-1]['task_index'] if per_task_rows else 'none'}. "
+                    f"Proceeding to evaluation on completed tasks."
+                )
+                break
+
+            gt_T = target_camera.T_world_cam.copy()
+            sim_poses.append(gt_T.copy())
+            gt_poses.append(gt_T.copy())
+            timestamps.append(float(task_idx + 1))
+            cut_row = {
+                "task_index": task_idx,
+                "sequence_reset": int(bool(task["reset"])),
+                "src_frame": src_frame_id,
+                "target_frame": tgt_frame_id,
+                "src_rgb": str(frame_index[src_frame_id]["rgb_path"]),
+                "target_rgb": str(tgt_frame["rgb_path"]),
+                "iterations_planned": int(iters_for_task),
+                "iterations_run": 0,
+                "dynamic_w": float(dynamic_w),
+                "feature_err_px": float(feature_err_px),
+                "final_residual": float("nan"),
+                "diverged": 0,
+                "cut_to_desired": 1,
+                "failure_type": type(e).__name__,
+                "failure_message": str(e),
+                "stop_reason": f"cut_after_{type(e).__name__}",
+                "depth_valid_pixels": (
+                    "" if depth_preflight_info is None
+                    else int(depth_preflight_info["valid_pixels"])
+                ),
+                "depth_finite_ratio": (
+                    "" if depth_preflight_info is None
+                    else float(depth_preflight_info["finite_ratio"])
+                ),
+                "initial_translation_gap": float(initial_translation_gap),
+                "initial_rotation_gap_deg": float(initial_rotation_gap),
+                "motion_max_translation_step": motion_max_translation_step,
+                "motion_max_rotation_step_deg": motion_max_rotation_step_deg,
+                "pre_cut_translation_gap": "",
+                "pre_cut_rotation_error_deg": "",
+                "translation_gap": 0.0,
+                "rotation_error_deg": 0.0,
+                "fps": 0.0,
+                "render_fps": 0.0,
+                "iter_ms_mean": 0.0,
+                "render_ms_mean": 0.0,
+                "controller_ms_mean": 0.0,
+                "loop_s": 0.0,
+                "viz_path": "",
+            }
+            per_task_rows.append(cut_row)
+            append_task_row(csv_path, cut_row)
+            write_tum(sim_tum, timestamps, sim_poses)
+            write_tum(gt_tum, timestamps, gt_poses)
+            current_camera = copy_camera_with_pose(target_camera, gt_T)
+            baseline_feature_err_px = None
+            print(
+                f"[{scene_name}] task {task_idx:04d} FAILED ({type(e).__name__}: {e}); "
+                f"cutting to {tgt_frame_id} desired pose and continuing."
+            )
+            continue
+
+        if step_callback is not None:
+            # Drop the ephemeral progress line; the final per-task summary below
+            # takes its place on a clean line.
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
 
         final_camera = result["camera"]
         sim_T = final_camera.T_world_cam.copy()
@@ -916,7 +1101,6 @@ def run_scene(scene_name, run_root, resume=False):
 
         translation_err = translation_error_from_pose(sim_T, gt_T)
         rotation_err = rotation_error_from_pose(sim_T, gt_T)
-        closed_pct = gap_closed_percent(initial_translation_gap, translation_err)
 
         sim_poses.append(sim_T)
         gt_poses.append(gt_T)
@@ -932,7 +1116,7 @@ def run_scene(scene_name, run_root, resume=False):
             if final_render is None:
                 final_render = scene.render(final_camera)
             task_viz_path = viz_dir / f"task_{task_idx:04d}_final_vs_target.png"
-            if CONTROLLER in ("photometric", "photometric_torch"):
+            if CONTROLLER == "photometric":
                 save_current_desired_error_visualization(
                     final_render,
                     target_image,
@@ -955,6 +1139,9 @@ def run_scene(scene_name, run_root, resume=False):
             "iterations_run": int(len(result["history"])),
             "dynamic_w": float(dynamic_w),
             "feature_err_px": float(feature_err_px),
+            "cut_to_desired": 0,
+            "failure_type": "",
+            "failure_message": "",
             "stop_reason": result["stop_reason"],
             "depth_valid_pixels": (
                 "" if depth_preflight_info is None
@@ -965,8 +1152,12 @@ def run_scene(scene_name, run_root, resume=False):
                 else float(depth_preflight_info["finite_ratio"])
             ),
             "initial_translation_gap": float(initial_translation_gap),
+            "initial_rotation_gap_deg": float(initial_rotation_gap),
+            "motion_max_translation_step": motion_max_translation_step,
+            "motion_max_rotation_step_deg": motion_max_rotation_step_deg,
+            "pre_cut_translation_gap": "",
+            "pre_cut_rotation_error_deg": "",
             "translation_gap": float(translation_err),
-            "gap_closed_pct": float(closed_pct),
             "rotation_error_deg": float(rotation_err),
             "fps": float(timing.get("fps", 0.0)),
             "render_fps": float(timing.get("render_fps", 0.0)),
@@ -978,8 +1169,6 @@ def run_scene(scene_name, run_root, resume=False):
         }
         per_task_rows.append(task_row)
 
-        write_tum(sim_tum, timestamps, sim_poses)
-        write_tum(gt_tum, timestamps, gt_poses)
         final_rendered = result.get("rendered")
         if final_rendered is None:
             final_rendered = scene.render(final_camera)
@@ -990,30 +1179,66 @@ def run_scene(scene_name, run_root, resume=False):
 
         task_row["final_residual"] = float(final_resid)
         task_row["diverged"] = int(bool(diverged))
-        append_task_row(csv_path, task_row)
 
-        residual_str = f"{_residual_label()}={_fmt_residual(final_resid)}"
         diverge_tag = " DIVERGED" if diverged else ""
         last_history = result["history"][-1] if result["history"] else {}
         last_info = last_history.get("controller_info", {})
-        err_label, err_value = controller_error_display(last_info)
+        _, err_value = controller_error_display(last_info)
+        # E/F: final feature-error magnitude per matched feature.
+        num_feats = last_info.get("num_inlier_matches") or 0
+        err_per_feature = final_resid / num_feats if num_feats else float("nan")
 
-        print(
-            f"[{scene_name}] task={task_idx:04d} "
-            f"{src_frame_id}->{tgt_frame_id} "
-            f"iters={len(result['history'])}/{MINI_ITERATIONS} "
-            f"stop={short_stop_reason(result['stop_reason'])} "
-            f"{err_label}={err_value} "
-            f"final_{residual_str} "
+        ident = color(f"[{scene_name}] task={task_idx:04d}", "cyan")
+        err_str = color(
+            f"Error={err_value} E/F={format_stat(err_per_feature, 3)}",
+            "yellow",
+        )
+        gap_str = color(
             f"t_gap={format_stat(translation_err, 6)} "
-            f"rot_gap={format_stat(rotation_err, 2)}deg "
-            f"closed={format_percent(closed_pct)} "
+            f"rot_gap={format_stat(rotation_err, 2)}deg",
+            "blue",
+        )
+        timing_str = color(
             f"fps={task_row['fps']:.1f} "
-            f"render_ms={task_row['render_ms_mean']:.2f}"
-            f"{diverge_tag}"
+            f"render_ms={task_row['render_ms_mean']:.2f}",
+            "magenta",
+        )
+        print(
+            f"{ident} {src_frame_id}->{tgt_frame_id} "
+            f"iters={len(result['history'])}/{MINI_ITERATIONS} "
+            f"{err_str} {gap_str} {timing_str}"
+            f"{color(diverge_tag, 'red', 'bold')}"
         )
 
         if diverged:
+            if CONTINUE_ON_TASK_FAILURE:
+                task_row["cut_to_desired"] = 1
+                task_row["failure_type"] = "diverged"
+                task_row["failure_message"] = (
+                    f"{_residual_label()}={_fmt_residual(final_resid)} > "
+                    f"{_fmt_residual(threshold)}"
+                )
+                task_row["stop_reason"] = "cut_after_diverged"
+                task_row["pre_cut_translation_gap"] = float(translation_err)
+                task_row["pre_cut_rotation_error_deg"] = float(rotation_err)
+                sim_poses[-1] = gt_T.copy()
+                translation_err = 0.0
+                rotation_err = 0.0
+                task_row["translation_gap"] = float(translation_err)
+                task_row["rotation_error_deg"] = float(rotation_err)
+                write_tum(sim_tum, timestamps, sim_poses)
+                write_tum(gt_tum, timestamps, gt_poses)
+                append_task_row(csv_path, task_row)
+                current_camera = copy_camera_with_pose(target_camera, gt_T)
+                baseline_feature_err_px = None
+                print(
+                    f"[{scene_name}] DIVERGED at task {task_idx:04d}: "
+                    f"{_residual_label()}={_fmt_residual(final_resid)} > "
+                    f"{_fmt_residual(threshold)}. Cutting to {tgt_frame_id} desired pose and continuing."
+                )
+                continue
+
+            append_task_row(csv_path, task_row)
             print(
                 f"[{scene_name}] DIVERGED at task {task_idx:04d}: "
                 f"{_residual_label()}={_fmt_residual(final_resid)} > "
@@ -1021,6 +1246,9 @@ def run_scene(scene_name, run_root, resume=False):
             )
             raise SystemExit(1)
 
+        write_tum(sim_tum, timestamps, sim_poses)
+        write_tum(gt_tum, timestamps, gt_poses)
+        append_task_row(csv_path, task_row)
         current_camera = copy_camera_with_pose(target_camera, sim_T)
 
     metrics = {}
@@ -1036,6 +1264,19 @@ def run_scene(scene_name, run_root, resume=False):
     else:
         print(f"[{scene_name}] no tasks completed; skipping evo evaluation")
         metrics = {"error": "no_completed_tasks"}
+
+    # Completed-task breakdown: a task either converged on its own or failed
+    # (diverged / errored) and was corrected by cutting to the desired pose.
+    def _is_corrected(row):
+        return str(row.get("cut_to_desired", 0)) in {"1", "True", "true"}
+
+    num_corrected = sum(_is_corrected(row) for row in per_task_rows)
+    num_converged = len(per_task_rows) - num_corrected
+    print(
+        f"\n=== {scene_name} completed tasks ({len(per_task_rows)} total) ===\n"
+        f"  converged: {num_converged}\n"
+        f"  failed (corrected): {num_corrected}"
+    )
 
     summary = {
         "scene": scene_name,
@@ -1058,15 +1299,36 @@ def run_scene(scene_name, run_root, resume=False):
         "stop_residual_px": float(STOP_RESIDUAL_PX),
         "stop_mse_per_px": float(STOP_MSE_PER_PX),
         "stop_ssd": (None if STOP_SSD is None else float(STOP_SSD)),
+        "diverge_residual_px": float(DIVERGE_RESIDUAL_PX),
+        "diverge_mse_per_px": float(DIVERGE_MSE_PER_PX),
         "min_interaction_rank": int(MIN_INTERACTION_RANK),
         "max_interaction_condition": (
             None
             if MAX_INTERACTION_CONDITION is None
             else float(MAX_INTERACTION_CONDITION)
         ),
+        "max_translation_step": (
+            None if MAX_TRANSLATION_STEP is None else float(MAX_TRANSLATION_STEP)
+        ),
+        "max_rotation_step_deg": (
+            None if MAX_ROTATION_STEP_DEG is None else float(MAX_ROTATION_STEP_DEG)
+        ),
+        "hard_translation_step": (
+            None if HARD_TRANSLATION_STEP is None else float(HARD_TRANSLATION_STEP)
+        ),
+        "hard_rotation_step_deg": (
+            None if HARD_ROTATION_STEP_DEG is None else float(HARD_ROTATION_STEP_DEG)
+        ),
+        "adaptive_step_fraction": float(ADAPTIVE_STEP_FRACTION),
+        "continue_on_task_failure": bool(CONTINUE_ON_TASK_FAILURE),
         "save_task_viz": bool(SAVE_TASK_VIZ),
         "task_viz_every": int(TASK_VIZ_EVERY),
+        "use_takes": bool(USE_TAKES),
+        "num_takes": int(num_takes),
         "num_tasks": len(per_task_rows),
+        "num_cuts": num_corrected,
+        "num_converged": num_converged,
+        "num_failed_corrected": num_corrected,
         "camera": camera_metadata(initial_camera),
         "sim_traj": str(sim_tum),
         "gt_traj": str(gt_tum),
@@ -1092,6 +1354,18 @@ def run(args):
         TRAJECTORY_CONFIG_KEYS,
         "trajectory",
     )
+    diverge_mse_per_px = getattr(args, "diverge_mse_per_px", None)
+    diverge_residual_px = getattr(args, "diverge_residual_px", None)
+    if diverge_mse_per_px is not None:
+        if diverge_mse_per_px <= 0.0:
+            raise ValueError("--diverge-mse-per-px must be > 0")
+        applied_config["diverge_mse_per_px"] = diverge_mse_per_px
+    if diverge_residual_px is not None:
+        if diverge_residual_px <= 0.0:
+            raise ValueError("--diverge-residual-px must be > 0")
+        applied_config["diverge_residual_px"] = diverge_residual_px
+    if getattr(args, "continue_on_task_failure", None) is not None:
+        applied_config["continue_on_task_failure"] = bool(args.continue_on_task_failure)
     apply_config(applied_config, globals(), TRAJECTORY_CONFIG_KEYS)
     if applied_config:
         print(f"Applied trajectory config: {format_applied_config(applied_config)}")
@@ -1104,75 +1378,97 @@ def run(args):
         tag = f"{CONTROLLER}_stride{STRIDE}_iters{MINI_ITERATIONS}"
 
     resume = args.resume is not None
-    if resume:
-        if args.resume == "auto":
-            run_root = find_latest_resumable_run(RENDERER, tag)
-            if run_root is None:
-                print(
-                    f"--resume: no resumable run found under "
-                    f"RUNS/trajectory/ matching tag '{tag}'. "
-                    f"Starting a fresh run."
-                )
-                resume = False
-            else:
-                print(f"Resuming run: {run_root}")
-        else:
-            run_root = Path(args.resume).resolve()
-            if not run_root.exists():
-                raise FileNotFoundError(f"--resume path not found: {run_root}")
-            print(f"Resuming run: {run_root}")
+    explicit_resume_root = None
+    if resume and args.resume != "auto":
+        explicit_resume_root = Path(args.resume).resolve()
+        if not explicit_resume_root.exists():
+            raise FileNotFoundError(f"--resume path not found: {explicit_resume_root}")
 
-    if not resume:
-        run_root = unique_run_root(
-            RUNS_ROOT,
-            "trajectory",
-            trajectory_run_parts(tag),
-        )
-
-    run_root.mkdir(parents=True, exist_ok=True)
+    matcher = trajectory_feature_matcher()
 
     overall = {}
     multi_dataset = len(DATASETS) > 1
     for scene_name in DATASETS:
+        scene_resume = resume
+        if not resume:
+            run_root = run_folder(
+                RUNS_ROOT,
+                scene_name,
+                CONTROLLER,
+                DEPTH_MODE,
+                matcher,
+                renderer=RENDERER,
+            )
+        elif explicit_resume_root is not None:
+            run_root = explicit_resume_root
+            print(f"Resuming run: {run_root}")
+        else:  # --resume auto
+            run_root = find_latest_resumable_run(
+                scene_name, RENDERER, CONTROLLER, DEPTH_MODE, matcher
+            )
+            if run_root is None:
+                print(
+                    f"--resume: no resumable run found under RUNS/ for "
+                    f"{run_folder_name(scene_name, CONTROLLER, DEPTH_MODE, matcher, renderer=RENDERER)}. "
+                    f"Starting a fresh run."
+                )
+                scene_resume = False
+                run_root = run_folder(
+                    RUNS_ROOT,
+                    scene_name,
+                    CONTROLLER,
+                    DEPTH_MODE,
+                    matcher,
+                    renderer=RENDERER,
+                )
+            else:
+                print(f"Resuming run: {run_root}")
+
+        run_root.mkdir(parents=True, exist_ok=True)
+
         try:
-            overall[scene_name] = run_scene(scene_name, run_root, resume=resume)
+            result = run_scene(scene_name, run_root, resume=scene_resume)
         except SystemExit as e:
             if not multi_dataset:
                 raise
             traceback.print_exc()
-            overall[scene_name] = {"error": f"SystemExit({e.code})"}
+            result = {"error": f"SystemExit({e.code})"}
         except Exception as e:
             traceback.print_exc()
-            overall[scene_name] = {"error": str(e)}
+            result = {"error": str(e)}
+        overall[scene_name] = result
 
-    write_run_json(run_root / "trajectory_summary.json", overall)
-    write_run_json(run_root / "summary.json", overall)
-    write_run_json(
-        run_root / "config.resolved.json",
-        resolved_trajectory_config(tag, run_root),
-    )
-    write_command(run_root / "command.txt")
-
-    summary_md = run_root / "summary.md"
-    write_trajectory_summary_markdown(summary_md, overall)
-    write_trajectory_summary_markdown(run_root / "trajectory_summary.md", overall)
-    write_run_readme(
-        run_root / "README.md",
-        "SERVIS Trajectory Run",
-        fields=[
-            ("datasets", ", ".join(DATASETS)),
-            ("renderer", RENDERER),
-            ("controller", CONTROLLER),
-            ("depth", DEPTH_MODE),
-            ("feature", FEATURE_METHOD),
-            ("tag", tag),
-        ],
-        artifacts=[
-            ("summary table", "summary.md"),
-            ("machine summary", "summary.json"),
-            ("resolved config", "config.resolved.json"),
-            ("scene outputs", "scenes/<dataset>/"),
-        ],
-    )
-    print(f"\nWrote {run_root}")
-    print(f"Summary table: {summary_md}")
+        # Each scene's folder is self-contained: write its details straight in.
+        scene_summary = {scene_name: result}
+        write_run_json(run_root / "trajectory_summary.json", scene_summary)
+        write_run_json(run_root / "summary.json", scene_summary)
+        write_run_json(
+            run_root / "config.resolved.json",
+            resolved_trajectory_config(tag, run_root),
+        )
+        write_command(run_root / "command.txt")
+        write_trajectory_summary_markdown(run_root / "summary.md", scene_summary)
+        write_trajectory_summary_markdown(
+            run_root / "trajectory_summary.md", scene_summary
+        )
+        write_run_readme(
+            run_root / "README.md",
+            "SERVIS Trajectory Run",
+            fields=[
+                ("scene", scene_name),
+                ("renderer", RENDERER),
+                ("controller", CONTROLLER),
+                ("depth", DEPTH_MODE),
+                ("feature", FEATURE_METHOD),
+                ("tag", tag),
+            ],
+            artifacts=[
+                ("summary table", "summary.md"),
+                ("machine summary", "summary.json"),
+                ("resolved config", "config.resolved.json"),
+                ("trajectories", "sim_traj.tum, gt_traj.tum"),
+                ("per-task errors", "per_task_errors.csv"),
+            ],
+        )
+        print(f"\nWrote {run_root}")
+        print(f"Summary table: {run_root / 'summary.md'}")
