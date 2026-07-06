@@ -24,43 +24,19 @@ from run_layout import (
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 RUNS_ROOT = PROJECT_ROOT / "RUNS"
 
-# Edit these values to define the frame-to-frame servo experiment.
-SCENE_DIR = PROJECT_ROOT / "DATA" / "kitchen"
-RENDERER = "mesh"  # "mesh", "gs", or "nerf"
-GS_MODEL = "standard"  # "standard" -> gs.ply, "moge" -> gs_moge.ply
-START_INDEX = 1
-INDEX_AWAY = 1
-TARGET_INDEX = None
-ITERATIONS = 100
-DT = 1.0
-DEPTH_MODE = "intrinsic"  # "learned" = MoGe2, "intrinsic" = scene.render_depth()
-FEATURE_METHOD = "sift"
-VIZ_ITER = 1
-GAIN_IBVS = 0.75
-GAIN_PHOTO = 0.75
-MIN_FEATURES = 3
-RATIO = 1
-RUN_NAME = None
-STOP_RESIDUAL_PX = 0.5      # IBVS: RMS reprojection error (px)
-STOP_MSE_PER_PX = 2.0e-6    # legacy photometric MSE; used when STOP_SSD is None
-STOP_SSD = None             # photometric: ViSP-style SSD threshold, or None
-DIVERGE_TRANSLATION_ERROR = 0.5  # final translation gap above which a task is "diverged"
-DIVERGE_ROTATION_ERROR_DEG = 30.0  # final rotation error above which a task is "diverged"
-MIN_INTERACTION_RANK = 6
-MAX_INTERACTION_CONDITION = 1.0e8
-MAX_TRANSLATION_STEP = 0.5
-MAX_ROTATION_STEP_DEG = 30.0
-HARD_TRANSLATION_STEP = 5.0
-HARD_ROTATION_STEP_DEG = 180.0
-ADAPTIVE_STEP_FRACTION = 0.25
+# --- experiment defaults ----------------------------------------------------
+# Every servo knob is declared once in SRC/config_schema.py (the single source
+# of truth) and seeded into these module-globals by apply_defaults(). The CLI
+# flags (--renderer, --iterations, --gain-photo, ...) and the interactive wizard
+# read the same schema, so runner/flag/wizard defaults cannot drift. Override a
+# run with --config / --set / the generated --flags.
+#
+# Notes: DEPTH_MODE "learned"=MoGe2, "intrinsic"=scene.render_depth();
+# STOP_SSD None => use STOP_MSE_PER_PX; set the pose DIVERGE_* thresholds to None
+# (e.g. --set diverge_translation_error=none) to disable them.
+from experiment_config import apply_defaults as _apply_defaults
 
-CONTROLLER = "ibvs"  # "ibvs" or "photometric"
-SIGMA_BLUR = 1.0
-USE_GZN = True
-GRAD_PERCENTILE = 50.0
-PHOTOMETRIC_MAX_PIXELS = 50_000
-USE_HUBER = True
-HUBER_K = None
+_apply_defaults(globals(), "servo_frames")
 
 
 def add_arguments(parser):
@@ -78,24 +54,12 @@ def add_arguments(parser):
             "--set renderer=mesh --set scene=kitchen."
         ),
     )
-    parser.add_argument(
-        "--diverge-translation-error",
-        type=float,
-        default=None,
-        help=(
-            "Mark the task diverged if final translation error exceeds this. "
-            "Overrides config/--set diverge_translation_error."
-        ),
-    )
-    parser.add_argument(
-        "--diverge-rotation-error-deg",
-        type=float,
-        default=None,
-        help=(
-            "Mark the task diverged if final rotation error exceeds this many degrees. "
-            "Overrides config/--set diverge_rotation_error_deg."
-        ),
-    )
+    # One typed --flag per schema field (--renderer, --iterations, --gain-photo,
+    # --diverge-*, ...), generated from config_schema so the flag surface never
+    # drifts from the config keys.
+    from experiment_config import add_schema_arguments
+
+    add_schema_arguments(parser, "servo_frames")
 
 
 def normalize_frame_id(value):
@@ -779,28 +743,21 @@ def run(args):
         apply_config,
         format_applied_config,
         load_cli_config,
+        overrides_from_args,
     )
     from features import FeatureMatcher
     from photometric import PhotometricControllerTorch
     from servo import run_servo_loop
     from viz import save_current_desired_error_visualization, save_error_evolution
 
+    # Named --flags and repeated --set fold into one override list (--set wins on
+    # a per-key clash); schema coercion enforces each field's bounds.
     applied_config = load_cli_config(
         args.config,
-        args.set,
+        overrides_from_args(args, "servo_frames"),
         SERVO_FRAMES_CONFIG_KEYS,
         "servo_frames",
     )
-    diverge_translation_error = getattr(args, "diverge_translation_error", None)
-    diverge_rotation_error_deg = getattr(args, "diverge_rotation_error_deg", None)
-    if diverge_translation_error is not None:
-        if diverge_translation_error <= 0.0:
-            raise ValueError("--diverge-translation-error must be > 0")
-        applied_config["diverge_translation_error"] = diverge_translation_error
-    if diverge_rotation_error_deg is not None:
-        if diverge_rotation_error_deg <= 0.0:
-            raise ValueError("--diverge-rotation-error-deg must be > 0")
-        applied_config["diverge_rotation_error_deg"] = diverge_rotation_error_deg
     apply_config(applied_config, globals(), SERVO_FRAMES_CONFIG_KEYS)
     if applied_config:
         print(f"Applied servo config: {format_applied_config(applied_config)}")

@@ -1,204 +1,64 @@
-"""JSON config helpers for SERVIS experiment entrypoints."""
+"""JSON config helpers for SERVIS experiment entrypoints.
 
+All parameter knowledge (names, UPPER module-globals, types, bounds, defaults,
+aliases) now lives in :mod:`config_schema`. This module derives the key maps,
+coercion/validation, and CLI plumbing from that single registry, and keeps the
+same public API the runners and ``cli.py`` already import:
+
+    TRAJECTORY_CONFIG_KEYS / SERVO_FRAMES_CONFIG_KEYS  snake -> UPPER maps
+    load_cli_config(config_path, overrides, key_map, kind) -> dict
+    apply_config(config, module_globals, key_map)
+    format_applied_config(config)
+    normalize_config(config, key_map, kind)
+
+plus the schema-driven additions used by the refactor:
+
+    apply_defaults(module_globals, kind)        seed a runner's module-globals
+    add_schema_arguments(parser, kind)          generate per-flag argparse
+    overrides_from_args(args, kind)             fold named flags + --set together
+"""
+
+import argparse
 import json
 from pathlib import Path
+
+import config_schema as schema
+from config_schema import (
+    BOOL,
+    CHOICE,
+    FEATURE,
+    FLOAT,
+    INT,
+    OPT_FLOAT,
+    OPT_INT,
+    OPT_STR,
+    SCENE_DIR,
+    STR,
+    STR_LIST,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_ROOT = PROJECT_ROOT / "CONFIGS"
 
+# --- derived from the schema (single source of truth) -----------------------
 
-_PHOTOMETRIC_KEYS = {
-    "controller": "CONTROLLER",
-    "sigma_blur": "SIGMA_BLUR",
-    "use_gzn": "USE_GZN",
-    "grad_percentile": "GRAD_PERCENTILE",
-    "photometric_max_pixels": "PHOTOMETRIC_MAX_PIXELS",
-    "stop_ssd": "STOP_SSD",
-    "use_huber": "USE_HUBER",
-    "huber_k": "HUBER_K",
-}
+TRAJECTORY_CONFIG_KEYS = schema.key_map(schema.TRAJECTORY)
+SERVO_FRAMES_CONFIG_KEYS = schema.key_map(schema.SERVO_FRAMES)
 
-TRAJECTORY_CONFIG_KEYS = {
-    "datasets": "DATASETS",
-    "renderer": "RENDERER",
-    "gs_model": "GS_MODEL",
-    "nerf_render_scale": "NERF_RENDER_SCALE",
-    "gs_render_scale": "GS_RENDER_SCALE",
-    "mesh_render_scale": "MESH_RENDER_SCALE",
-    "stride": "STRIDE",
-    "mini_iterations": "MINI_ITERATIONS",
-    "dt": "DT",
-    "depth_mode": "DEPTH_MODE",
-    "feature_method": "FEATURE_METHOD",
-    "gain_ibvs": "GAIN_IBVS",
-    "gain_photo": "GAIN_PHOTO",
-    "min_features": "MIN_FEATURES",
-    "ratio": "RATIO",
-    "start_index": "START_INDEX",
-    "max_pairs": "MAX_PAIRS",
-    "use_takes": "USE_TAKES",
-    "takes_jump_factor": "TAKES_JUMP_FACTOR",
-    "stop_residual_px": "STOP_RESIDUAL_PX",
-    "stop_mse_per_px": "STOP_MSE_PER_PX",
-    "stop_plateau_iters": "STOP_PLATEAU_ITERS",
-    "stop_plateau_ratio": "STOP_PLATEAU_RATIO",
-    "diverge_residual_px": "DIVERGE_RESIDUAL_PX",
-    "diverge_mse_per_px": "DIVERGE_MSE_PER_PX",
-    "diverge_translation_error": "DIVERGE_TRANSLATION_ERROR",
-    "diverge_rotation_error_deg": "DIVERGE_ROTATION_ERROR_DEG",
-    "min_interaction_rank": "MIN_INTERACTION_RANK",
-    "max_interaction_condition": "MAX_INTERACTION_CONDITION",
-    "max_translation_step": "MAX_TRANSLATION_STEP",
-    "max_rotation_step_deg": "MAX_ROTATION_STEP_DEG",
-    "hard_translation_step": "HARD_TRANSLATION_STEP",
-    "hard_rotation_step_deg": "HARD_ROTATION_STEP_DEG",
-    "adaptive_step_fraction": "ADAPTIVE_STEP_FRACTION",
-    "continue_on_task_failure": "CONTINUE_ON_TASK_FAILURE",
-    "dynamic_ibvs_iters": "DYNAMIC_IBVS_ITERS",
-    "rpe_delta": "RPE_DELTA",
-    "run_tag": "RUN_TAG",
-    "save_task_viz": "SAVE_TASK_VIZ",
-    "task_viz_every": "TASK_VIZ_EVERY",
-    **_PHOTOMETRIC_KEYS,
+RENDERERS = set(schema.RENDERERS)
+GS_MODELS = set(schema.GS_MODELS)
+DEPTH_MODES = set(schema.DEPTH_MODES)
+CONTROLLERS = set(schema.CONTROLLERS)
+
+# Map a key_map object back to its kind so the coercion path can find fields.
+_KIND_BY_KEYMAP_ID = {
+    id(TRAJECTORY_CONFIG_KEYS): schema.TRAJECTORY,
+    id(SERVO_FRAMES_CONFIG_KEYS): schema.SERVO_FRAMES,
 }
 
-SERVO_FRAMES_CONFIG_KEYS = {
-    "scene_dir": "SCENE_DIR",
-    "renderer": "RENDERER",
-    "gs_model": "GS_MODEL",
-    "start_index": "START_INDEX",
-    "index_away": "INDEX_AWAY",
-    "target_index": "TARGET_INDEX",
-    "iterations": "ITERATIONS",
-    "dt": "DT",
-    "depth_mode": "DEPTH_MODE",
-    "feature_method": "FEATURE_METHOD",
-    "viz_iter": "VIZ_ITER",
-    "gain_ibvs": "GAIN_IBVS",
-    "gain_photo": "GAIN_PHOTO",
-    "min_features": "MIN_FEATURES",
-    "ratio": "RATIO",
-    "run_name": "RUN_NAME",
-    "stop_residual_px": "STOP_RESIDUAL_PX",
-    "stop_mse_per_px": "STOP_MSE_PER_PX",
-    "diverge_translation_error": "DIVERGE_TRANSLATION_ERROR",
-    "diverge_rotation_error_deg": "DIVERGE_ROTATION_ERROR_DEG",
-    "stop_plateau_iters": "STOP_PLATEAU_ITERS",
-    "stop_plateau_ratio": "STOP_PLATEAU_RATIO",
-    "min_interaction_rank": "MIN_INTERACTION_RANK",
-    "max_interaction_condition": "MAX_INTERACTION_CONDITION",
-    "max_translation_step": "MAX_TRANSLATION_STEP",
-    "max_rotation_step_deg": "MAX_ROTATION_STEP_DEG",
-    "hard_translation_step": "HARD_TRANSLATION_STEP",
-    "hard_rotation_step_deg": "HARD_ROTATION_STEP_DEG",
-    "adaptive_step_fraction": "ADAPTIVE_STEP_FRACTION",
-    **_PHOTOMETRIC_KEYS,
-}
 
-COMMON_ALIASES = {
-    "feature": "feature_method",
-    "matcher": "feature_method",
-    "depth": "depth_mode",
-    "viz_every": "viz_iter",
-    "visualize_every": "viz_iter",
-    "min_matches": "min_features",
-    "gain": "gain_ibvs",
-}
-
-KIND_ALIASES = {
-    "trajectory": {
-        "dataset": "datasets",
-        "scene": "datasets",
-        "scenes": "datasets",
-        "iters": "mini_iterations",
-        "iterations": "mini_iterations",
-        "max_tasks": "max_pairs",
-        "pairs": "max_pairs",
-        "save_viz": "save_task_viz",
-        "task_viz": "save_task_viz",
-        "task_viz_stride": "task_viz_every",
-        "continue_after_failure": "continue_on_task_failure",
-        "cut_on_failure": "continue_on_task_failure",
-        "tag": "run_tag",
-        "nerf_scale": "nerf_render_scale",
-        "render_scale": "nerf_render_scale",
-        "diverge_tr_error": "diverge_translation_error",
-        "diverge_rot_error": "diverge_rotation_error_deg",
-        "diverge_rot_error_deg": "diverge_rotation_error_deg",
-    },
-    "servo_frames": {
-        "dataset": "scene_dir",
-        "scene": "scene_dir",
-        "target": "target_index",
-        "start": "start_index",
-        "away": "index_away",
-        "iters": "iterations",
-        "tag": "run_name",
-        "diverge_tr_error": "diverge_translation_error",
-        "diverge_rot_error": "diverge_rotation_error_deg",
-        "diverge_rot_error_deg": "diverge_rotation_error_deg",
-    },
-}
-
-RENDERERS = {"mesh", "gs", "nerf"}
-GS_MODELS = {"standard", "moge"}
-DEPTH_MODES = {"learned", "intrinsic"}
-CONTROLLERS = {"ibvs", "photometric"}
-
-INT_KEYS = {
-    "stride",
-    "mini_iterations",
-    "iterations",
-    "min_features",
-    "ratio",
-    "n1",
-    "start_index",
-    "index_away",
-    "viz_iter",
-    "rpe_delta",
-    "task_viz_every",
-    "photometric_max_pixels",
-    "min_interaction_rank",
-}
-OPTIONAL_INT_KEYS = {"max_pairs", "target_index", "stop_plateau_iters"}
-FLOAT_KEYS = {
-    "dt",
-    "gain_ibvs",
-    "gain_photo",
-    "nerf_render_scale",
-    "gs_render_scale",
-    "mesh_render_scale",
-    "stop_residual_px",
-    "stop_mse_per_px",
-    "diverge_residual_px",
-    "diverge_mse_per_px",
-    "sigma_blur",
-    "grad_percentile",
-    "takes_jump_factor",
-    "adaptive_step_fraction",
-    "stop_plateau_ratio",
-}
-OPTIONAL_FLOAT_KEYS = {
-    "huber_k",
-    "stop_ssd",
-    "max_interaction_condition",
-    "max_translation_step",
-    "max_rotation_step_deg",
-    "hard_translation_step",
-    "hard_rotation_step_deg",
-    "diverge_translation_error",
-    "diverge_rotation_error_deg",
-}
-BOOL_KEYS = {
-    "save_task_viz",
-    "use_gzn",
-    "use_huber",
-    "dynamic_ibvs_iters",
-    "use_takes",
-    "continue_on_task_failure",
-}
-OPTIONAL_STR_KEYS = {"run_tag", "run_name"}
+# --- config file loading ----------------------------------------------------
 
 
 def resolve_config_path(path):
@@ -238,40 +98,12 @@ def parse_literal(text):
         return text
 
 
+# --- key / alias resolution -------------------------------------------------
+
+
 def canonical_config_key(raw_key, kind):
     key = str(raw_key).strip().lower().replace("-", "_")
-    key = COMMON_ALIASES.get(key, key)
-    key = KIND_ALIASES.get(kind, {}).get(key, key)
-    return key
-
-
-def parse_cli_overrides(overrides, key_map, kind):
-    config = {}
-    for override in overrides or []:
-        if "=" not in override:
-            raise ValueError(
-                f"Expected --set KEY=VALUE, got {override!r}"
-            )
-        key, value = override.split("=", 1)
-        config[key] = parse_literal(value)
-    return normalize_config(config, key_map, kind)
-
-
-def load_cli_config(config_path, overrides, key_map, kind):
-    config = {}
-    if config_path is not None:
-        config.update(normalize_config(
-            load_config_file(config_path, expected_kind=kind),
-            key_map,
-            kind,
-        ))
-    config.update(parse_cli_overrides(overrides, key_map, kind))
-    return config
-
-
-def apply_config(config, module_globals, key_map):
-    for key, value in config.items():
-        module_globals[key_map[key]] = value
+    return schema.alias_map(kind).get(key, key)
 
 
 def normalize_config(config, key_map, kind):
@@ -289,90 +121,68 @@ def normalize_config(config, key_map, kind):
     return normalized
 
 
+# --- coercion / validation (derived from Field type + bounds) ---------------
+
+
 def coerce_config_value(key, value):
-    if key == "datasets":
+    field = schema.field_by_name(key)
+    if field is None:
+        return value
+    return coerce_field_value(field, value)
+
+
+def coerce_field_value(field, value):
+    t = field.type
+    if t == STR_LIST:
         return coerce_str_list(value)
-    if key == "scene_dir":
+    if t == SCENE_DIR:
         return coerce_scene_dir(value)
-    if key in OPTIONAL_INT_KEYS:
-        if is_null_value(value):
-            return None
-        value = int(value)
-        if value < 1:
-            raise ValueError(f"{key} must be >= 1 or null")
-        return value
-    if key in INT_KEYS:
-        value = int(value)
-        validate_int_value(key, value)
-        return value
-    if key in FLOAT_KEYS:
-        value = float(value)
-        if key == "dt" and value <= 0.0:
-            raise ValueError("dt must be > 0")
-        if (
-            key in {"nerf_render_scale", "gs_render_scale", "mesh_render_scale"}
-            and value <= 0.0
-        ):
-            raise ValueError(f"{key} must be > 0")
-        if key == "sigma_blur" and value < 0.0:
-            raise ValueError("sigma_blur must be >= 0")
-        if key == "grad_percentile" and not (0.0 <= value < 100.0):
-            raise ValueError("grad_percentile must be in [0, 100)")
-        if key in {
-            "stop_residual_px",
-            "stop_mse_per_px",
-            "diverge_residual_px",
-            "diverge_mse_per_px",
-        } and value <= 0.0:
-            raise ValueError(f"{key} must be > 0")
-        if key == "adaptive_step_fraction" and value < 0.0:
-            raise ValueError("adaptive_step_fraction must be >= 0")
-        return value
-    if key in OPTIONAL_FLOAT_KEYS:
-        if is_null_value(value):
-            return None
-        value = float(value)
-        if key == "max_interaction_condition" and value <= 0.0:
-            raise ValueError("max_interaction_condition must be > 0 or null")
-        if key in {
-            "max_translation_step",
-            "max_rotation_step_deg",
-            "hard_translation_step",
-            "hard_rotation_step_deg",
-            "diverge_translation_error",
-            "diverge_rotation_error_deg",
-        } and value <= 0.0:
-            raise ValueError(f"{key} must be > 0 or null")
-        return value
-    if key in BOOL_KEYS:
+    if t == BOOL:
         return coerce_bool(value)
-    if key == "controller":
-        value = str(value).lower()
-        if value not in CONTROLLERS:
-            raise ValueError(f"controller must be one of {sorted(CONTROLLERS)}")
-        return value
-    if key in OPTIONAL_STR_KEYS:
+    if t == CHOICE:
+        text = str(value).lower()
+        if text not in field.choices:
+            raise ValueError(f"{field.name} must be one of {sorted(field.choices)}")
+        return text
+    if t == FEATURE:
+        return str(value).lower()
+    if t == STR:
+        return str(value)
+    if t == OPT_STR:
+        return None if is_null_value(value) else str(value)
+    if t == OPT_INT:
         if is_null_value(value):
             return None
-        return str(value)
-    if key == "renderer":
-        value = str(value).lower()
-        if value not in RENDERERS:
-            raise ValueError(f"renderer must be one of {sorted(RENDERERS)}")
-        return value
-    if key == "gs_model":
-        value = str(value).lower()
-        if value not in GS_MODELS:
-            raise ValueError(f"gs_model must be one of {sorted(GS_MODELS)}")
-        return value
-    if key == "depth_mode":
-        value = str(value).lower()
-        if value not in DEPTH_MODES:
-            raise ValueError(f"depth_mode must be one of {sorted(DEPTH_MODES)}")
-        return value
-    if key == "feature_method":
-        return str(value).lower()
+        return _bounded(field, int(value))
+    if t == INT:
+        return _bounded(field, int(value))
+    if t == OPT_FLOAT:
+        if is_null_value(value):
+            return None
+        return _bounded(field, float(value))
+    if t == FLOAT:
+        return _bounded(field, float(value))
     return value
+
+
+def _bounded(field, value):
+    if field.vmin is not None:
+        if field.vmin_inclusive:
+            if value < field.vmin:
+                raise ValueError(f"{field.name} must be >= {_num(field.vmin)}")
+        elif value <= field.vmin:
+            raise ValueError(f"{field.name} must be > {_num(field.vmin)}")
+    if field.vmax is not None:
+        if field.vmax_inclusive:
+            if value > field.vmax:
+                raise ValueError(f"{field.name} must be <= {_num(field.vmax)}")
+        elif value >= field.vmax:
+            raise ValueError(f"{field.name} must be < {_num(field.vmax)}")
+    return value
+
+
+def _num(x):
+    return int(x) if float(x).is_integer() else x
 
 
 def coerce_str_list(value):
@@ -416,25 +226,99 @@ def is_null_value(value):
     return value is None or str(value).strip().lower() in {"", "none", "null"}
 
 
-def validate_int_value(key, value):
-    if key in {"start_index", "min_features", "stride", "rpe_delta"} and value < 1:
-        raise ValueError(f"{key} must be >= 1")
-    if key == "min_interaction_rank" and not (1 <= value <= 6):
-        raise ValueError("min_interaction_rank must be in [1, 6]")
-    if key in {
-        "mini_iterations",
-        "iterations",
-        "ratio",
-        "dynamic_scheduling",
-        "n1",
-        "dt",
-        "task_viz_every",
-        "photometric_max_pixels",
-    } and value < 0:
-        raise ValueError(f"{key} must be >= 0")
+# --- overrides + loading ----------------------------------------------------
+
+
+def parse_cli_overrides(overrides, key_map, kind):
+    config = {}
+    for override in overrides or []:
+        if "=" not in override:
+            raise ValueError(f"Expected --set KEY=VALUE, got {override!r}")
+        key, value = override.split("=", 1)
+        config[key] = parse_literal(value)
+    return normalize_config(config, key_map, kind)
+
+
+def load_cli_config(config_path, overrides, key_map, kind):
+    config = {}
+    if config_path is not None:
+        config.update(
+            normalize_config(
+                load_config_file(config_path, expected_kind=kind), key_map, kind
+            )
+        )
+    config.update(parse_cli_overrides(overrides, key_map, kind))
+    return config
+
+
+def apply_config(config, module_globals, key_map):
+    for key, value in config.items():
+        module_globals[key_map[key]] = value
 
 
 def format_applied_config(config):
     if not config:
         return "none"
     return ", ".join(f"{key}={value!r}" for key, value in sorted(config.items()))
+
+
+# --- schema-driven CLI plumbing (new) ---------------------------------------
+
+
+def apply_defaults(module_globals, kind):
+    """Seed a runner's UPPER module-globals with the schema defaults.
+
+    Called at runner import so the runtime defaults and the wizard/flag defaults
+    come from one place and cannot drift.
+    """
+    for const, value in schema.defaults_for(kind).items():
+        module_globals[const] = value
+
+
+def _flag_help(field, kind):
+    default = field.default_for(kind)
+    hint = "blank/none" if default is None else repr(default)
+    parts = [field.help or field.name, f"(default: {hint})"]
+    if field.applies:
+        parts.append(f"[{field.applies} only]")
+    return " ".join(parts)
+
+
+def add_schema_arguments(parser, kind):
+    """Generate one --flag per schema field for a runner's subparser.
+
+    Flags default to argparse.SUPPRESS so an unset flag stays absent from the
+    namespace; ``overrides_from_args`` then only forwards the ones the user
+    actually passed. ``--set`` remains the escape hatch and wins over flags.
+    """
+    for field in schema.fields_for(kind):
+        kwargs = {
+            "dest": field.name,
+            "default": argparse.SUPPRESS,
+            "help": _flag_help(field, kind),
+        }
+        if field.type == BOOL:
+            parser.add_argument(
+                field.flag, action=argparse.BooleanOptionalAction, **kwargs
+            )
+        else:
+            metavar = field.name.upper()
+            parser.add_argument(field.flag, metavar=metavar, type=str, **kwargs)
+
+
+def overrides_from_args(args, kind):
+    """Fold explicitly-passed named flags + repeated --set into one list.
+
+    Returns a list of ``KEY=VALUE`` strings suitable for ``load_cli_config``.
+    Named flags come first, then --set entries, so --set overrides a flag.
+    """
+    overrides = []
+    for field in schema.fields_for(kind):
+        if not hasattr(args, field.name):
+            continue
+        value = getattr(args, field.name)
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        overrides.append(f"{field.name}={value}")
+    overrides.extend(getattr(args, "set", []) or [])
+    return overrides

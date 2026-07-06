@@ -24,6 +24,8 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import config_schema
+from wizard import build_config as wizard_build_config
 from runners import compare as runner_compare
 from runners import inspect as runner_inspect
 from runners import matrix as runner_matrix
@@ -153,8 +155,6 @@ CONTROLLERS = {
     "photometric": "PVS  (photometric)",
 }
 
-DEPTH_MODES = ["intrinsic", "learned"]
-FEATURE_METHODS = ["sift", "xfeat"]
 
 
 def detect_renderers(scene_dir):
@@ -693,238 +693,17 @@ def wizard():
 
     # --- per-controller capability ------------------------------------------
 
-    def common_questions(controller, renderers):
-        is_ibvs = controller == "ibvs"
-        is_photo = controller == "photometric"
-
-        qs = [
-            q_select(
-                "renderer",
-                "Renderer:",
-                [Choice(r, value=r) for r in renderers],
-                default=renderers[0],
-            ),
-            q_select(
-                "depth_mode",
-                "Depth mode:",
-                [
-                    Choice("intrinsic  — scene.render_depth()", value="intrinsic"),
-                    Choice("learned    — MoGe2", value="learned"),
-                ],
-                default="intrinsic",
-            ),
-        ]
-        if is_ibvs:
-            qs += [
-                q_select(
-                    "feature_method",
-                    "Feature method:",
-                    [Choice(m, value=m) for m in FEATURE_METHODS],
-                    default="sift",
-                ),
-                q_text("gain_ibvs", "Gain IBVS:", 0.75, float),
-            ]
-        if is_photo:
-            qs += [
-                q_text("gain_photo", "Gain photometric:", 0.75, float),
-                q_text("sigma_blur", "Sigma blur:", 1.0, float),
-                q_confirm("use_gzn", "Use GZN?", default=True),
-                q_text("grad_percentile", "Grad percentile:", 50.0, float),
-                q_text("photometric_max_pixels", "Photometric max pixels:", 50000, int),
-                q_confirm("use_huber", "Use Huber loss?", default=True),
-                q_text("huber_k", "Huber k (blank = auto):", None, float, optional=True),
-            ]
-        return qs
-
-    def build_servo_frames_config(controller, scene_name, renderers):
-        is_ibvs = controller == "ibvs"
-        is_photo = controller == "photometric"
-
-        cfg = {"kind": "servo_frames", "scene_dir": scene_name, "controller": controller}
-
-        if is_photo:
-            console.rule("[bold magenta]Photometric controller knobs[/]")
-        cfg.update(run_prompt(common_questions(controller, renderers)))
-
-        console.rule("[bold magenta]Frame selection[/]")
-        frame_qs = [
-            q_text("start_index", "Start index:", 1, int),
-            q_text(
-                "target_index",
-                "Target index (blank → use index_away):",
-                None,
-                int,
-                optional=True,
-            ),
-            q_text(
-                "index_away",
-                "Index away:",
-                1,
-                int,
-                when=lambda a: a.get("target_index") is None,
-            ),
-        ]
-        frame_ans = run_prompt(frame_qs)
-        cfg["start_index"] = frame_ans["start_index"]
-        cfg["target_index"] = frame_ans.get("target_index")
-        cfg["index_away"] = frame_ans.get("index_away", 1)
-
-        console.rule("[bold magenta]Servo loop[/]")
-        loop_qs = [
-            q_text("iterations", "Iterations:", 100, int),
-            q_text("dt", "dt:", 1.0, float),
-        ]
-        if is_ibvs:
-            loop_qs += [
-                q_text("min_features", "Min features:", 3, int),
-                q_text("ratio", "Match ratio (0 = match once):", 1, int),
-            ]
-        loop_qs += [q_text("viz_iter", "Viz every N iters (0 disables):", 1, int)]
-        if is_ibvs:
-            loop_qs += [
-                q_text(
-                    "stop_residual_px",
-                    "IBVS stop: RMS reprojection error (px):",
-                    0.5,
-                    float,
-                )
-            ]
-        if is_photo:
-            loop_qs += [
-                q_text(
-                    "stop_mse_per_px",
-                    "Photometric stop: mean(e^2) per pixel on [0,1]:",
-                    2.0e-6,
-                    float,
-                )
-            ]
-        loop_qs += [
-            q_text(
-                "stop_plateau_iters",
-                "Stop if plateauing for N iterations (blank = disabled):",
-                None,
-                int,
-                optional=True,
-            ),
-            q_text("run_name", "Run name (blank = auto):", None, str, optional=True)
-        ]
-        cfg.update(run_prompt(loop_qs))
-        return cfg
-
-    def build_trajectory_config(controller, datasets, renderers, run_tag_default=None):
-        is_ibvs = controller == "ibvs"
-        is_photo = controller == "photometric"
-
-        cfg = {"kind": "trajectory", "datasets": list(datasets), "controller": controller}
-
-        if is_photo:
-            console.rule("[bold magenta]Photometric controller knobs[/]")
-        cfg.update(run_prompt(common_questions(controller, renderers)))
-
-        if cfg["renderer"] == "nerf":
-            cfg.update(
-                run_prompt([q_text("nerf_render_scale", "NeRF render scale:", 0.25, float)])
-            )
-        elif cfg["renderer"] == "gs":
-            cfg.update(
-                run_prompt([q_text("gs_render_scale", "GS render scale:", 1.0, float)])
-            )
-        elif cfg["renderer"] == "mesh":
-            cfg.update(
-                run_prompt([q_text("mesh_render_scale", "Mesh render scale:", 1.0, float)])
-            )
-
-        console.rule("[bold magenta]Trajectory pacing[/]")
-        pacing_qs = [
-            q_text("stride", "Stride between frames:", 1, int),
-            q_text("mini_iterations", "Iterations per mini task:", 500, int),
-            q_text("dt", "dt:", 1.0, float),
-        ]
-        if is_ibvs:
-            pacing_qs += [
-                q_text("min_features", "Min features:", 3, int),
-                q_text("ratio", "Match ratio:", 1, int),
-            ]
-        pacing_qs += [
-            q_text("start_index", "Start index:", 1, int),
-            q_text("max_pairs", "Max pairs (blank = all):", None, int, optional=True),
-            q_text("rpe_delta", "RPE delta:", 1, int),
-        ]
-        cfg.update(run_prompt(pacing_qs))
-
-        console.rule("[bold magenta]Stopping + viz[/]")
-        stop_qs = []
-        if is_ibvs:
-            stop_qs += [
-                q_text(
-                    "stop_residual_px",
-                    "IBVS stop: RMS reprojection error (px):",
-                    0.5,
-                    float,
-                ),
-                q_text(
-                    "diverge_residual_px",
-                    "IBVS abort if final error exceeds px:",
-                    1000.0,
-                    float,
-                ),
-            ]
-        if is_photo:
-            stop_qs += [
-                q_text(
-                    "stop_mse_per_px",
-                    "Photometric stop: mean(e^2) per pixel on [0,1]:",
-                    2.0e-6,
-                    float,
-                ),
-                q_text(
-                    "diverge_mse_per_px",
-                    "Photometric abort if final MSE/px exceeds:",
-                    1.0e-2,
-                    float,
-                ),
-            ]
-        stop_qs += [
-            q_text(
-                "diverge_translation_error",
-                "Abort if final translation error exceeds (blank = disabled):",
-                0.5,
-                float,
-                optional=True,
-            ),
-            q_text(
-                "diverge_rotation_error_deg",
-                "Abort if final rotation error exceeds deg (blank = disabled):",
-                30.0,
-                float,
-                optional=True,
-            ),
-            q_text(
-                "stop_plateau_iters",
-                "Stop if plateauing for N iterations (blank = disabled):",
-                None,
-                int,
-                optional=True,
-            ),
-        ]
-        stop_qs += [
-            q_confirm(
-                "continue_on_task_failure",
-                "Cut to target pose and continue after failed tasks?",
-                default=False,
-            ),
-            q_confirm("save_task_viz", "Save per-task viz?", default=True),
-            q_text("task_viz_every", "Save viz every N tasks:", 1, int),
-            q_text(
-                "run_tag",
-                "Run tag (blank = auto):",
-                run_tag_default,
-                str,
-                optional=True,
-            ),
-        ]
-        cfg.update(run_prompt(stop_qs))
-        return cfg
+    # Experiment-config prompts are generated from config_schema (single source
+    # of truth) by wizard.build_config, which reuses these prompt helpers so the
+    # copy-settings / fast-forward behaviour is preserved. See SRC/wizard.py.
+    wizard_ctx = SimpleNamespace(
+        q_text=q_text,
+        q_select=q_select,
+        q_confirm=q_confirm,
+        run_prompt=run_prompt,
+        console=console,
+        Choice=Choice,
+    )
 
     def run_inspect_wizard(scene_name, scene_renderers):
         try:
@@ -1299,12 +1078,31 @@ def wizard():
                         console.print("[yellow]No renderer is available in every dataset.[/]")
                     console.print("[grey50]datasets:[/] " + ", ".join(comparison_datasets))
                     scene_name = "all_datasets"
-                    cfg = build_trajectory_config(controller, comparison_datasets, scene_renderers, run_tag_default="compare_all")
+                    cfg = wizard_build_config(
+                        config_schema.TRAJECTORY,
+                        controller,
+                        {"datasets": comparison_datasets},
+                        scene_renderers,
+                        wizard_ctx,
+                        run_tag_default="compare_all",
+                    )
                 else:
                     if task_key == "servo_frames":
-                        cfg = build_servo_frames_config(controller, scene_name, scene_renderers)
+                        cfg = wizard_build_config(
+                            config_schema.SERVO_FRAMES,
+                            controller,
+                            {"scene_dir": scene_name},
+                            scene_renderers,
+                            wizard_ctx,
+                        )
                     else:
-                        cfg = build_trajectory_config(controller, [scene_name], scene_renderers)
+                        cfg = wizard_build_config(
+                            config_schema.TRAJECTORY,
+                            controller,
+                            {"datasets": [scene_name]},
+                            scene_renderers,
+                            wizard_ctx,
+                        )
 
                 console.print()
                 console.print(

@@ -46,61 +46,35 @@ from runners.servo_frames import (
 # subcommand without pulling them in.
 
 
-DATASETS = ["living"]
-RENDERER = "gs"
-GS_MODEL = "standard"  # "standard" -> gs.ply, "moge" -> gs_moge.ply
-NERF_RENDER_SCALE = 0.25
-GS_RENDER_SCALE = 1.0
-MESH_RENDER_SCALE = 1.0
-STRIDE = 1
-MINI_ITERATIONS = 500
-DT = 1.0
-DEPTH_MODE = "intrinsic"
-FEATURE_METHOD = "sift"
-RUN_TAG = "GS_SIFT_INTRINSIC"
-GAIN_IBVS = 0.75
-GAIN_PHOTO = 0.75
-MIN_FEATURES = 3
-RATIO = 1
-START_INDEX = 1
-MAX_PAIRS = None
-# Split the capture into "takes" (smooth passes separated by camera teleports)
-# and run them back-to-back as one trajectory: at each take boundary the camera
-# resets to the GT pose of that take's first frame instead of servoing across
-# the jump. Still one run, one TUM pair, one evo evaluation. See SRC/takes.py.
-USE_TAKES = True
-TAKES_JUMP_FACTOR = 5.0
-STOP_RESIDUAL_PX = 0.5      # IBVS: RMS reprojection error (px)
-STOP_MSE_PER_PX = 2.0e-6    # legacy photometric MSE; used when STOP_SSD is None
-STOP_SSD = None             # photometric: ViSP-style SSD threshold, or None
-# Per-task divergence abort thresholds. Set pose thresholds to None to disable.
-DIVERGE_RESIDUAL_PX = 1000.0  # IBVS: feature error (px) above which a task is "diverged"
-DIVERGE_MSE_PER_PX = 0.01     # photometric: image MSE/px above which a task is "diverged"
-DIVERGE_TRANSLATION_ERROR = 0.5  # final translation gap above which a task is "diverged"
-DIVERGE_ROTATION_ERROR_DEG = 30.0  # final rotation error above which a task is "diverged"
-MIN_INTERACTION_RANK = 6
-MAX_INTERACTION_CONDITION = 1.0e8
-MAX_TRANSLATION_STEP = 0.5
-MAX_ROTATION_STEP_DEG = 30.0
-HARD_TRANSLATION_STEP = 5.0
-HARD_ROTATION_STEP_DEG = 180.0
-ADAPTIVE_STEP_FRACTION = 0.25
-CONTINUE_ON_TASK_FAILURE = False
-RPE_DELTA = 1
-SAVE_TASK_VIZ = True
-TASK_VIZ_EVERY = 1
-# Live per-iteration progress shown in the terminal while each mini-task runs
-# (iter NNN/MMM ...), updated in place. "auto" => only when stdout is a TTY, so
-# redirected logs keep just the final per-task lines. True forces it, False off.
-SHOW_STEP_PROGRESS = "auto"
+# --- experiment defaults ----------------------------------------------------
+# Every servo knob is declared once in SRC/config_schema.py (the single source
+# of truth) and seeded into these module-globals by apply_defaults(). The CLI
+# flags (--stride, --gain-photo, ...) and the interactive wizard read the same
+# schema, so runner defaults, flag defaults and wizard defaults cannot drift.
+# Override per run with --config / --set / the generated --flags.
+#
+# Domain notes that used to sit beside individual constants:
+#   USE_TAKES / TAKES_JUMP_FACTOR  Split the capture into "takes" (smooth passes
+#     separated by camera teleports) and run them back-to-back as one trajectory;
+#     at each take boundary the camera resets to the GT pose of that take's first
+#     frame instead of servoing across the jump. Still one run, one TUM pair, one
+#     evo evaluation. See SRC/takes.py.
+#   STOP_SSD  Photometric ViSP-style SSD threshold; None => use STOP_MSE_PER_PX.
+#   DIVERGE_*  Per-task divergence abort thresholds; set the pose thresholds to
+#     None (e.g. --set diverge_translation_error=none) to disable them.
+#   DYNAMIC_IBVS_ITERS  Dynamic iteration schedule for IBVS launches (paper eq.7):
+#     N(w) = N1 if w>1; N1/3 if w<1/3; round(w*N1) otherwise, where
+#     w(i) = ||n_r_i - n_q_i|| / ||n_r_1 - n_q_1|| over filtered correspondences.
+#     Disabled for non-IBVS controllers.
+from experiment_config import apply_defaults as _apply_defaults
 
-# Dynamic iteration schedule for IBVS launches (paper eq. 7):
-#     N(w) = N1                if w > 1
-#          = N1 / 3            if w < 1/3
-#          = round(w * N1)     otherwise
-# where w(i) = ||n_r_i - n_q_i||_2 / ||n_r_1 - n_q_1||_2 over filtered
-# correspondences (pixels). Disabled for non-IBVS controllers.
-DYNAMIC_IBVS_ITERS = True
+_apply_defaults(globals(), "trajectory")
+
+# Live per-iteration progress shown while each mini-task runs (iter NNN/MMM ...),
+# updated in place. "auto" => only when stdout is a TTY, so redirected cluster
+# logs keep just the final per-task lines; True forces it, False off. This is a
+# terminal-UX toggle, not a servo knob, so it is not part of the schema.
+SHOW_STEP_PROGRESS = "auto"
 
 
 def _show_step_progress() -> bool:
@@ -181,51 +155,12 @@ def add_arguments(parser):
             "specific run dir."
         ),
     )
-    parser.add_argument(
-        "--diverge-mse-per-px",
-        type=float,
-        default=None,
-        help=(
-            "Photometric trajectory abort threshold on final image MSE per pixel. "
-            "Overrides config/--set diverge_mse_per_px."
-        ),
-    )
-    parser.add_argument(
-        "--diverge-residual-px",
-        type=float,
-        default=None,
-        help=(
-            "IBVS trajectory abort threshold on final feature residual in pixels. "
-            "Overrides config/--set diverge_residual_px."
-        ),
-    )
-    parser.add_argument(
-        "--diverge-translation-error",
-        type=float,
-        default=None,
-        help=(
-            "Trajectory abort threshold on final translation error. "
-            "Overrides config/--set diverge_translation_error."
-        ),
-    )
-    parser.add_argument(
-        "--diverge-rotation-error-deg",
-        type=float,
-        default=None,
-        help=(
-            "Trajectory abort threshold on final rotation error in degrees. "
-            "Overrides config/--set diverge_rotation_error_deg."
-        ),
-    )
-    parser.add_argument(
-        "--continue-on-task-failure",
-        action="store_true",
-        default=None,
-        help=(
-            "When a mini-task fails or diverges, record a cut to its desired "
-            "pose and continue with the next task instead of aborting."
-        ),
-    )
+    # One typed --flag per schema field (--stride, --renderer, --gain-photo,
+    # --diverge-*, --continue-on-task-failure/--no-..., ...). Generated from
+    # config_schema so the flag surface never drifts from the config keys.
+    from experiment_config import add_schema_arguments
+
+    add_schema_arguments(parser, "trajectory")
 
 
 def make_frame_index(records):
@@ -1574,36 +1509,18 @@ def run(args):
         apply_config,
         format_applied_config,
         load_cli_config,
+        overrides_from_args,
     )
 
+    # Named --flags and repeated --set are folded into one override list
+    # (--set wins on a per-key clash); their bounds are enforced by the schema
+    # coercion, so no per-flag validation is needed here.
     applied_config = load_cli_config(
         args.config,
-        args.set,
+        overrides_from_args(args, "trajectory"),
         TRAJECTORY_CONFIG_KEYS,
         "trajectory",
     )
-    diverge_mse_per_px = getattr(args, "diverge_mse_per_px", None)
-    diverge_residual_px = getattr(args, "diverge_residual_px", None)
-    diverge_translation_error = getattr(args, "diverge_translation_error", None)
-    diverge_rotation_error_deg = getattr(args, "diverge_rotation_error_deg", None)
-    if diverge_mse_per_px is not None:
-        if diverge_mse_per_px <= 0.0:
-            raise ValueError("--diverge-mse-per-px must be > 0")
-        applied_config["diverge_mse_per_px"] = diverge_mse_per_px
-    if diverge_residual_px is not None:
-        if diverge_residual_px <= 0.0:
-            raise ValueError("--diverge-residual-px must be > 0")
-        applied_config["diverge_residual_px"] = diverge_residual_px
-    if diverge_translation_error is not None:
-        if diverge_translation_error <= 0.0:
-            raise ValueError("--diverge-translation-error must be > 0")
-        applied_config["diverge_translation_error"] = diverge_translation_error
-    if diverge_rotation_error_deg is not None:
-        if diverge_rotation_error_deg <= 0.0:
-            raise ValueError("--diverge-rotation-error-deg must be > 0")
-        applied_config["diverge_rotation_error_deg"] = diverge_rotation_error_deg
-    if getattr(args, "continue_on_task_failure", None) is not None:
-        applied_config["continue_on_task_failure"] = bool(args.continue_on_task_failure)
     apply_config(applied_config, globals(), TRAJECTORY_CONFIG_KEYS)
     if applied_config:
         print(f"Applied trajectory config: {format_applied_config(applied_config)}")
