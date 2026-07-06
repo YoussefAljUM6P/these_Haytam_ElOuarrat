@@ -17,6 +17,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from datetime import datetime
@@ -27,14 +28,17 @@ from runners import compare as runner_compare
 from runners import inspect as runner_inspect
 from runners import matrix as runner_matrix
 from runners import mesh_check as runner_mesh_check
+from runners import plot as runner_plot
 from runners import servo_frames as runner_servo_frames
 from runners import smoke as runner_smoke
 from runners import trajectory as runner_trajectory
+from runners import video as runner_video
 from scene_assets import has_nerfstudio_checkpoint
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = PROJECT_ROOT / "DATA"
+RUNS_ROOT = PROJECT_ROOT / "RUNS"
 CONFIG_ROOT = PROJECT_ROOT / "CONFIGS"
 
 
@@ -62,6 +66,14 @@ SUBCOMMANDS = {
     "inspect": {
         "runner": runner_inspect,
         "help": "Render pose at frame N and compare to real image (optional features).",
+    },
+    "plot": {
+        "runner": runner_plot,
+        "help": "Regenerate detailed evo APE/RPE plots from a previous run's trajectories.",
+    },
+    "video": {
+        "runner": runner_video,
+        "help": "Compile a run's saved visualizations into one MP4 at a chosen FPS.",
     },
     "mesh-check": {
         "runner": runner_mesh_check,
@@ -99,6 +111,11 @@ def dispatch(args):
 
 
 TASKS = {
+    "resume_trajectory": {
+        "kind": "trajectory",
+        "command": "trajectory",
+        "label": "Resume     — continue one of the last 15 trajectory runs",
+    },
     "compare_table": {
         "kind": "trajectory",
         "command": "trajectory",
@@ -118,6 +135,16 @@ TASKS = {
         "kind": "inspect",
         "command": "inspect",
         "label": "Inspect     — render pose at frame N vs real image",
+    },
+    "plot_run": {
+        "kind": "plot",
+        "command": "plot",
+        "label": "Plots      — detailed evo plots of a previous run",
+    },
+    "video_run": {
+        "kind": "video",
+        "command": "video",
+        "label": "Video      — compile a run's visualizations into one MP4 (variable FPS)",
     },
 }
 
@@ -139,6 +166,39 @@ def detect_renderers(scene_dir):
     if has_nerfstudio_checkpoint(scene_dir):
         available.append("nerf")
     return available
+
+
+def scene_pose_count(scene_dir):
+    """Number of registered camera poses in the COLMAP sparse model.
+
+    This is the source of trajectory tasks (consecutive pose pairs). Prefers the
+    pose count cached in takes.json (num_frames); falls back to reading sparse/0
+    directly. Returns None when the scene has no sparse model.
+    """
+    takes = scene_dir / "takes.json"
+    if takes.is_file():
+        try:
+            n = json.loads(takes.read_text()).get("num_frames")
+            if isinstance(n, int) and n > 0:
+                return n
+        except (OSError, ValueError):
+            pass
+    if (scene_dir / "sparse" / "0").is_dir():
+        try:
+            import pycolmap
+
+            return len(pycolmap.Reconstruction(str(scene_dir / "sparse" / "0")).images)
+        except Exception:
+            return None
+    return None
+
+
+def scene_task_count(scene_dir):
+    """Trajectory tasks for a scene = consecutive pose pairs = poses - 1."""
+    poses = scene_pose_count(scene_dir)
+    if poses is None or poses < 2:
+        return None
+    return poses - 1
 
 
 def list_scenes():
@@ -192,6 +252,7 @@ def wizard():
     from rich.text import Text
 
     console = Console()
+    copied_cfg = {}
 
     QSTYLE = Style(
         [
@@ -205,6 +266,9 @@ def wizard():
         ]
     )
 
+    class GoBack(Exception):
+        pass
+
     def ask_select(message, choices, default=None):
         result = questionary.select(
             message, choices=choices, style=QSTYLE, default=default, qmark="›"
@@ -212,6 +276,13 @@ def wizard():
         if result is None:
             raise KeyboardInterrupt
         return result
+
+    def ask_select_with_back(message, choices, default=None):
+        choices_with_back = list(choices) + [Choice("« Back", value="__back__")]
+        res = ask_select(message, choices_with_back, default)
+        if res == "__back__":
+            raise GoBack()
+        return res
 
     def ask_confirm(message, default=True):
         result = questionary.confirm(
@@ -268,17 +339,250 @@ def wizard():
             header_style="bold",
         )
         table.add_column("scene", style="green")
+        table.add_column("tasks", justify="right", style="cyan")
         table.add_column("mesh", justify="center")
         table.add_column("gs", justify="center")
         table.add_column("nerf", justify="center")
         for name, rs in scenes:
+            n_tasks = scene_task_count(DATA_ROOT / name)
             table.add_row(
                 name,
+                str(n_tasks) if n_tasks is not None else "[grey50]·[/]",
                 "[green]✓[/]" if "mesh" in rs else "[grey50]·[/]",
                 "[green]✓[/]" if "gs" in rs else "[grey50]·[/]",
                 "[green]✓[/]" if "nerf" in rs else "[grey50]·[/]",
             )
         console.print(table)
+
+    def read_json_file(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def read_resume_scene(run_dir, resolved_config, summary):
+        if isinstance(summary, dict) and len(summary) == 1:
+            scene_key, scene_summary = next(iter(summary.items()))
+            if isinstance(scene_summary, dict) and scene_summary.get("scene"):
+                return str(scene_summary["scene"])
+            return str(scene_key)
+
+        datasets = resolved_config.get("datasets")
+        if isinstance(datasets, list) and len(datasets) == 1:
+            return str(datasets[0])
+        if isinstance(datasets, str) and datasets.strip():
+            return datasets.split(",")[0].strip()
+
+        return run_dir.name.split("-")[0].lower()
+
+    def read_resume_progress(run_dir):
+        csv_path = run_dir / "per_task_errors.csv"
+        try:
+            with open(csv_path) as f:
+                rows = list(csv.DictReader(f))
+        except (OSError, csv.Error):
+            rows = []
+
+        if not rows:
+            return {
+                "tasks_done": 0,
+                "last_task": None,
+                "last_target": None,
+                "last_failure": None,
+            }
+
+        last = rows[-1]
+        failure = last.get("failure_type") or None
+        return {
+            "tasks_done": len(rows),
+            "last_task": last.get("task_index"),
+            "last_target": last.get("target_frame"),
+            "last_failure": failure,
+        }
+
+    def build_resume_info(run_dir):
+        resolved = read_json_file(run_dir / "config.resolved.json") or {}
+        summary = read_json_file(run_dir / "summary.json") or {}
+        scene = read_resume_scene(run_dir, resolved, summary)
+        progress = read_resume_progress(run_dir)
+
+        csv_path = run_dir / "per_task_errors.csv"
+        mtime = max(
+            p.stat().st_mtime
+            for p in (run_dir, csv_path, run_dir / "summary.json")
+            if p.exists()
+        )
+
+        return {
+            "path": run_dir,
+            "scene": scene,
+            "resolved": resolved,
+            "summary": summary,
+            "progress": progress,
+            "mtime": mtime,
+        }
+
+    def has_resume_config(info):
+        cfg = info["resolved"]
+        required = (
+            "renderer",
+            "controller",
+            "depth_mode",
+            "stride",
+            "mini_iterations",
+            "start_index",
+        )
+        if not all(key in cfg for key in required):
+            return False
+        if cfg.get("controller") == "ibvs" and "feature_method" not in cfg:
+            return False
+        return True
+
+    def discover_resume_runs(limit=15):
+        runs_root = PROJECT_ROOT / "RUNS"
+        if not runs_root.is_dir():
+            return []
+
+        runs = []
+        for entry in runs_root.iterdir():
+            if not entry.is_dir():
+                continue
+            required = (
+                entry / "config.resolved.json",
+                entry / "per_task_errors.csv",
+                entry / "sim_traj.tum",
+                entry / "gt_traj.tum",
+            )
+            if not all(path.exists() for path in required):
+                continue
+            info = build_resume_info(entry)
+            if not has_resume_config(info):
+                continue
+            runs.append(info)
+
+        runs.sort(key=lambda item: item["mtime"], reverse=True)
+        return runs[:limit]
+
+    def resume_label(info):
+        cfg = info["resolved"]
+        progress = info["progress"]
+        modified = datetime.fromtimestamp(info["mtime"]).strftime("%Y-%m-%d %H:%M")
+        controller = cfg.get("controller", "?")
+        renderer = cfg.get("renderer", "?")
+        depth = cfg.get("depth_mode", "?")
+        feature = cfg.get("feature_method")
+        method = f"{renderer}/{controller}/{depth}"
+        if controller == "ibvs" and feature:
+            method += f"/{feature}"
+
+        status = f"{progress['tasks_done']} tasks"
+        if progress["last_task"] is not None:
+            status += f", next {int(progress['last_task']) + 1}"
+        if progress["last_failure"]:
+            status += f", last failed: {progress['last_failure']}"
+
+        rel = info["path"].relative_to(PROJECT_ROOT)
+        return f"{modified}  {rel}  [{info['scene']} {method}]  {status}"
+
+    def resume_config_for_runner(info):
+        from experiment_config import TRAJECTORY_CONFIG_KEYS
+
+        cfg = {
+            key: value
+            for key, value in info["resolved"].items()
+            if key in TRAJECTORY_CONFIG_KEYS
+        }
+        cfg["datasets"] = [info["scene"]]
+        cfg.setdefault("controller", "ibvs")
+        cfg.setdefault("renderer", "gs")
+        cfg.setdefault("depth_mode", "intrinsic")
+        return cfg
+
+    def config_to_set_args(cfg):
+        return [f"{key}={json.dumps(value)}" for key, value in sorted(cfg.items())]
+
+    def run_resume_wizard():
+        runs = discover_resume_runs(limit=15)
+        if not runs:
+            console.print(
+                f"[red]No resumable trajectory runs found under {PROJECT_ROOT / 'RUNS'}[/]"
+            )
+            return 1
+
+        table = Table(
+            title="Last 15 Resumable Trajectory Runs",
+            title_style="bold cyan",
+            border_style="grey50",
+            header_style="bold",
+        )
+        table.add_column("#", justify="right", style="cyan")
+        table.add_column("modified", style="green")
+        table.add_column("run")
+        table.add_column("scene")
+        table.add_column("method")
+        table.add_column("progress", justify="right")
+        for idx, info in enumerate(runs, start=1):
+            cfg = info["resolved"]
+            progress = info["progress"]
+            method = "/".join(
+                str(part)
+                for part in (
+                    cfg.get("renderer", "?"),
+                    cfg.get("controller", "?"),
+                    cfg.get("depth_mode", "?"),
+                    cfg.get("feature_method") if cfg.get("controller") == "ibvs" else None,
+                )
+                if part is not None
+            )
+            progress_text = str(progress["tasks_done"])
+            if progress["last_failure"]:
+                progress_text += f" ({progress['last_failure']})"
+            table.add_row(
+                str(idx),
+                datetime.fromtimestamp(info["mtime"]).strftime("%Y-%m-%d %H:%M"),
+                str(info["path"].relative_to(PROJECT_ROOT)),
+                info["scene"],
+                method,
+                progress_text,
+            )
+        console.print(table)
+
+        try:
+            selected = ask_select_with_back(
+                "Resume run:",
+                [Choice(resume_label(info), value=info) for info in runs],
+                default=runs[0],
+            )
+        except GoBack:
+            return "__back__"
+
+        cfg = resume_config_for_runner(selected)
+
+        console.print()
+        console.print(
+            Panel(
+                Syntax(json.dumps(cfg, indent=2), "json", theme="ansi_dark"),
+                title="[bold]Resume config[/]",
+                border_style="cyan",
+            )
+        )
+        if not ask_confirm("Resume this run now?", default=True):
+            console.print("[yellow]resume cancelled[/]")
+            return 0
+
+        console.rule("[bold green]Resuming trajectory[/]")
+        runner_args = SimpleNamespace(
+            command="trajectory",
+            config=None,
+            set=config_to_set_args(cfg),
+            resume=str(selected["path"]),
+            diverge_mse_per_px=None,
+            diverge_residual_px=None,
+            continue_on_task_failure=None,
+        )
+        runner_trajectory.run(runner_args)
+        return 0
 
     # --- declarative question helpers (questionary.prompt with when=) ------
 
@@ -307,6 +611,12 @@ def wizard():
         return _f
 
     def q_select(name, message, choices, default=None, when=None):
+        actual_val = copied_cfg.get(name, default)
+        matched_choice = None
+        for c in choices:
+            if getattr(c, "value", c) == actual_val:
+                matched_choice = c
+                break
         q = {
             "type": "select",
             "name": name,
@@ -315,20 +625,23 @@ def wizard():
             "qmark": "›",
             "style": QSTYLE,
         }
-        if default is not None:
+        if matched_choice is not None:
+            q["default"] = matched_choice
+        elif default is not None:
             q["default"] = default
         if when is not None:
             q["when"] = when
         return q
 
     def q_text(name, message, default, caster=str, optional=False, when=None):
+        actual_val = copied_cfg.get(name, default)
         q = {
             "type": "text",
             "name": name,
             "message": message,
-            "default": "" if default is None else str(default),
+            "default": "" if actual_val is None else str(actual_val),
             "validate": _text_validator(caster, optional),
-            "filter": _text_filter(default, caster, optional),
+            "filter": _text_filter(actual_val, caster, optional),
             "qmark": "›",
             "style": QSTYLE,
         }
@@ -337,11 +650,12 @@ def wizard():
         return q
 
     def q_confirm(name, message, default=True, when=None):
+        actual_val = copied_cfg.get(name, default)
         q = {
             "type": "confirm",
             "name": name,
             "message": message,
-            "default": default,
+            "default": bool(actual_val) if actual_val is not None else default,
             "qmark": "›",
             "style": QSTYLE,
         }
@@ -352,10 +666,30 @@ def wizard():
     def run_prompt(questions):
         if not questions:
             return {}
-        ans = questionary.prompt(questions)
-        if not ans and "when" not in questions[0]:
-            raise KeyboardInterrupt
-        return ans
+
+        answers = {}
+        ALWAYS_ASK = {"renderer"}
+
+        for q in questions:
+            if "when" in q and callable(q["when"]):
+                if not q["when"](answers):
+                    continue
+
+            name = q["name"]
+
+            if fast_forward and copied_cfg and name not in ALWAYS_ASK and name in copied_cfg:
+                answers[name] = copied_cfg[name]
+                continue
+
+            q_copy = dict(q)
+            q_copy.pop("when", None)
+
+            res = questionary.prompt([q_copy])
+            if not res:
+                raise KeyboardInterrupt
+            answers[name] = res[name]
+
+        return answers
 
     # --- per-controller capability ------------------------------------------
 
@@ -392,7 +726,7 @@ def wizard():
             ]
         if is_photo:
             qs += [
-                q_text("gain_photo", "Gain photometric:", 0.005, float),
+                q_text("gain_photo", "Gain photometric:", 0.75, float),
                 q_text("sigma_blur", "Sigma blur:", 1.0, float),
                 q_confirm("use_gzn", "Use GZN?", default=True),
                 q_text("grad_percentile", "Grad percentile:", 50.0, float),
@@ -465,6 +799,13 @@ def wizard():
                 )
             ]
         loop_qs += [
+            q_text(
+                "stop_plateau_iters",
+                "Stop if plateauing for N iterations (blank = disabled):",
+                None,
+                int,
+                optional=True,
+            ),
             q_text("run_name", "Run name (blank = auto):", None, str, optional=True)
         ]
         cfg.update(run_prompt(loop_qs))
@@ -484,11 +825,19 @@ def wizard():
             cfg.update(
                 run_prompt([q_text("nerf_render_scale", "NeRF render scale:", 0.25, float)])
             )
+        elif cfg["renderer"] == "gs":
+            cfg.update(
+                run_prompt([q_text("gs_render_scale", "GS render scale:", 1.0, float)])
+            )
+        elif cfg["renderer"] == "mesh":
+            cfg.update(
+                run_prompt([q_text("mesh_render_scale", "Mesh render scale:", 1.0, float)])
+            )
 
         console.rule("[bold magenta]Trajectory pacing[/]")
         pacing_qs = [
             q_text("stride", "Stride between frames:", 1, int),
-            q_text("mini_iterations", "Iterations per mini task:", 30, int),
+            q_text("mini_iterations", "Iterations per mini task:", 500, int),
             q_text("dt", "dt:", 1.0, float),
         ]
         if is_ibvs:
@@ -536,6 +885,29 @@ def wizard():
                 ),
             ]
         stop_qs += [
+            q_text(
+                "diverge_translation_error",
+                "Abort if final translation error exceeds (blank = disabled):",
+                0.5,
+                float,
+                optional=True,
+            ),
+            q_text(
+                "diverge_rotation_error_deg",
+                "Abort if final rotation error exceeds deg (blank = disabled):",
+                30.0,
+                float,
+                optional=True,
+            ),
+            q_text(
+                "stop_plateau_iters",
+                "Stop if plateauing for N iterations (blank = disabled):",
+                None,
+                int,
+                optional=True,
+            ),
+        ]
+        stop_qs += [
             q_confirm(
                 "continue_on_task_failure",
                 "Cut to target pose and continue after failed tasks?",
@@ -555,183 +927,442 @@ def wizard():
         return cfg
 
     def run_inspect_wizard(scene_name, scene_renderers):
-        if len(scene_renderers) == 1:
-            renderer = scene_renderers[0]
-            console.print(f"[grey50]renderer auto-picked:[/] [bold]{renderer}[/]")
-        else:
-            renderer = ask_select(
-                "Renderer:",
-                [Choice(r, value=r) for r in scene_renderers],
-                default=scene_renderers[0],
+        try:
+            if len(scene_renderers) == 1:
+                renderer = scene_renderers[0]
+                console.print(f"[grey50]renderer auto-picked:[/] [bold]{renderer}[/]")
+            else:
+                renderer = ask_select_with_back(
+                    "Renderer:",
+                    [Choice(r, value=r) for r in scene_renderers],
+                    default=scene_renderers[0],
+                )
+
+            index = ask_text("Frame index (1-based):", 1, int)
+
+            features = ask_select(
+                "Feature overlay:",
+                [
+                    Choice("none   — just side-by-side render vs real", value="none"),
+                    Choice("sift   — overlay SIFT matches (RANSAC filtered)", value="sift"),
+                    Choice("xfeat  — overlay XFeat matches (RANSAC filtered)", value="xfeat"),
+                ],
+                default="none",
             )
 
-        index = ask_text("Frame index (1-based):", 1, int)
+            output = ask_text(
+                "Output PNG path (blank = auto under RUNS/inspect/):",
+                None,
+                str,
+                optional=True,
+            )
 
-        features = ask_select(
-            "Feature overlay:",
-            [
-                Choice("none   — just side-by-side render vs real", value="none"),
-                Choice("sift   — overlay SIFT matches (RANSAC filtered)", value="sift"),
-                Choice("xfeat  — overlay XFeat matches (RANSAC filtered)", value="xfeat"),
-            ],
-            default="none",
+            console.rule("[bold green]Launching inspect[/]")
+            runner_args = SimpleNamespace(
+                command="inspect",
+                scene=scene_name,
+                index=int(index),
+                renderer=renderer,
+                features=features,
+                output=output,
+            )
+            runner_inspect.run(runner_args)
+            return 0
+
+        except GoBack:
+            return "__back__"
+
+    def discover_plot_runs(limit=15):
+        """Any run dir that has both TUM trajectory files can be re-plotted."""
+        runs_root = PROJECT_ROOT / "RUNS"
+        if not runs_root.is_dir():
+            return []
+        runs = []
+        for entry in runs_root.iterdir():
+            if not entry.is_dir():
+                continue
+            if not (entry / "sim_traj.tum").exists() or not (entry / "gt_traj.tum").exists():
+                continue
+            runs.append(build_resume_info(entry))
+        runs.sort(key=lambda item: item["mtime"], reverse=True)
+        return runs[:limit]
+
+    def run_plot_wizard():
+        runs = discover_plot_runs(limit=15)
+        if not runs:
+            console.print(
+                f"[red]No runs with sim_traj.tum + gt_traj.tum found under "
+                f"{PROJECT_ROOT / 'RUNS'}[/]"
+            )
+            return 1
+
+        table = Table(
+            title="Last 15 Runs Available for Plotting",
+            title_style="bold cyan",
+            border_style="grey50",
+            header_style="bold",
         )
+        table.add_column("#", justify="right", style="cyan")
+        table.add_column("modified", style="green")
+        table.add_column("run")
+        table.add_column("scene")
+        for idx, info in enumerate(runs, start=1):
+            table.add_row(
+                str(idx),
+                datetime.fromtimestamp(info["mtime"]).strftime("%Y-%m-%d %H:%M"),
+                str(info["path"].relative_to(PROJECT_ROOT)),
+                info["scene"],
+            )
+        console.print(table)
 
-        output = ask_text(
-            "Output PNG path (blank = auto under RUNS/inspect/):",
-            None,
-            str,
-            optional=True,
-        )
+        try:
+            selected = ask_select_with_back(
+                "Plot run:",
+                [
+                    Choice(
+                        f"{datetime.fromtimestamp(info['mtime']).strftime('%Y-%m-%d %H:%M')}"
+                        f"  {info['path'].relative_to(PROJECT_ROOT)}  [{info['scene']}]",
+                        value=info,
+                    )
+                    for info in runs
+                ],
+                default=runs[0],
+            )
+            rpe_delta = ask_text("RPE delta (frames):", 1, int)
+            out = ask_text(
+                "Output dir (blank = <run>/evo_plots):", None, str, optional=True
+            )
+        except GoBack:
+            return "__back__"
 
-        console.rule("[bold green]Launching inspect[/]")
+        console.rule("[bold green]Generating detailed evo plots[/]")
         runner_args = SimpleNamespace(
-            command="inspect",
-            scene=scene_name,
-            index=int(index),
-            renderer=renderer,
-            features=features,
-            output=output,
+            command="plot",
+            run=str(selected["path"]),
+            rpe_delta=int(rpe_delta),
+            out=out,
         )
-        runner_inspect.run(runner_args)
+        runner_plot.run(runner_args)
         return 0
+
+    def run_has_visuals(run_dir):
+        """A run is encodable if it has saved viz PNGs or rebuildable frames."""
+        if list(run_dir.glob("visualizations/*.png")):
+            return True
+        if list(run_dir.glob("*/visualizations/*.png")) or list(
+            run_dir.glob("scenes/*/visualizations/*.png")
+        ):
+            return True
+        return (
+            (run_dir / "summary.json").exists()
+            and (run_dir / "sim_traj.tum").exists()
+            and (run_dir / "per_task_errors.csv").exists()
+        )
+
+    def discover_video_runs(limit=15):
+        runs_root = PROJECT_ROOT / "RUNS"
+        if not runs_root.is_dir():
+            return []
+        runs = []
+        for entry in runs_root.iterdir():
+            if not entry.is_dir() or not run_has_visuals(entry):
+                continue
+            runs.append(build_resume_info(entry))
+        runs.sort(key=lambda item: item["mtime"], reverse=True)
+        return runs[:limit]
+
+    def run_video_wizard():
+        runs = discover_video_runs(limit=15)
+        if not runs:
+            console.print(
+                f"[red]No runs with saved visualizations found under "
+                f"{PROJECT_ROOT / 'RUNS'}[/]"
+            )
+            return 1
+
+        table = Table(
+            title="Last 15 Runs Available for Video",
+            title_style="bold cyan",
+            border_style="grey50",
+            header_style="bold",
+        )
+        table.add_column("#", justify="right", style="cyan")
+        table.add_column("modified", style="green")
+        table.add_column("run")
+        table.add_column("scene")
+        for idx, info in enumerate(runs, start=1):
+            table.add_row(
+                str(idx),
+                datetime.fromtimestamp(info["mtime"]).strftime("%Y-%m-%d %H:%M"),
+                str(info["path"].relative_to(PROJECT_ROOT)),
+                info["scene"],
+            )
+        console.print(table)
+
+        try:
+            selected = ask_select_with_back(
+                "Video run:",
+                [
+                    Choice(
+                        f"{datetime.fromtimestamp(info['mtime']).strftime('%Y-%m-%d %H:%M')}"
+                        f"  {info['path'].relative_to(PROJECT_ROOT)}  [{info['scene']}]",
+                        value=info,
+                    )
+                    for info in runs
+                ],
+                default=runs[0],
+            )
+            fps = ask_text("FPS (frames per second):", 6.0, float)
+            scene = ask_text(
+                "Scene subdirectory (blank = all):", None, str, optional=True
+            )
+            output = ask_text(
+                "Output path (blank = <run>/trajectory_visualizations.mp4):",
+                None,
+                str,
+                optional=True,
+            )
+            render_missing = ask_confirm(
+                "Rebuild frames from trajectories if none are saved?", default=False
+            )
+        except GoBack:
+            return "__back__"
+
+        if float(fps) <= 0:
+            console.print("[red]FPS must be > 0[/]")
+            return 1
+
+        console.rule("[bold green]Compiling visualizations into MP4[/]")
+        runner_args = SimpleNamespace(
+            command="video",
+            run=str(selected["path"]),
+            latest=False,
+            scene=scene,
+            fps=float(fps),
+            output=output,
+            codec="mp4v",
+            pattern="visualizations/*.png",
+            render_missing=render_missing,
+            max_frames=None,
+        )
+        runner_video.run(runner_args)
+        return 0
+
+    def discover_copy_runs(controller_type, limit=15):
+        runs = discover_resume_runs(limit=100)
+        filtered = [r for r in runs if r["resolved"].get("controller") == controller_type]
+        return filtered[:limit]
 
     banner()
-    scenes = list_scenes()
-    if not scenes:
-        console.print(f"[red]No scene directories found under {DATA_ROOT}[/]")
-        return 1
+    state = "TASK"
+    task_key = "trajectory"
+    scene_name = None
+    controller = "ibvs"
+    cfg = {}
+    fast_forward = False
 
-    scene_table(scenes)
-    console.print()
-
-    task_key = ask_select(
-        "Task type:",
-        [Choice(v["label"], value=k) for k, v in TASKS.items()],
-        default="trajectory",
-    )
-
-    if task_key == "inspect":
-        scene_name = ask_select(
-            "Scene:",
-            [
-                Choice(
-                    f"{name}   [{', '.join(rs) if rs else 'no renderable assets'}]",
-                    value=name,
+    while True:
+        try:
+            if state == "TASK":
+                task_key = ask_select(
+                    "Task type:",
+                    [Choice(v["label"], value=k) for k, v in TASKS.items()] + [Choice("Exit", value="__exit__")],
+                    default=task_key,
                 )
-                for name, rs in scenes
-            ],
-            default=scenes[0][0],
-        )
-        scene_renderers = dict(scenes)[scene_name]
-        if not scene_renderers:
-            console.print(
-                f"[red]Scene {scene_name!r} has no renderable assets "
-                f"(expected mesh.ply, gs.ply, or nerf/).[/]"
-            )
-            return 1
-        return run_inspect_wizard(scene_name, scene_renderers)
+                if task_key == "__exit__":
+                    return 0
+                if task_key == "resume_trajectory":
+                    state = "RESUME"
+                elif task_key == "inspect":
+                    state = "INSPECT_SCENE"
+                elif task_key == "plot_run":
+                    state = "PLOT_RUN"
+                elif task_key == "video_run":
+                    state = "VIDEO_RUN"
+                else:
+                    state = "CONTROLLER"
 
-    controller = ask_select(
-        "Controller:",
-        [Choice(v, value=k) for k, v in CONTROLLERS.items()],
-        default="ibvs",
-    )
+            elif state == "RESUME":
+                res = run_resume_wizard()
+                if res == "__back__":
+                    state = "TASK"
+                else:
+                    return res
 
-    if task_key == "compare_table":
-        comparison_scenes = renderable_scenes(scenes)
-        if not comparison_scenes:
-            console.print(
-                "[red]No renderable datasets found under DATA/ "
-                "(expected mesh.ply, gs.ply, or nerf/).[/]"
-            )
-            return 1
-        comparison_datasets = [name for name, _ in comparison_scenes]
-        scene_renderers = ordered_renderers(comparison_scenes, common=True)
-        if not scene_renderers:
-            scene_renderers = ordered_renderers(comparison_scenes, common=False)
-            console.print(
-                "[yellow]No renderer is available in every dataset; datasets "
-                "missing the selected renderer will be marked failed in the table.[/]"
-            )
-        console.print(
-            "[grey50]datasets:[/] " + ", ".join(comparison_datasets)
-        )
-        scene_name = "all_datasets"
-        cfg = build_trajectory_config(
-            controller,
-            comparison_datasets,
-            scene_renderers,
-            run_tag_default="compare_all",
-        )
-    else:
-        scene_name = ask_select(
-            "Scene:",
-            [
-                Choice(
-                    f"{name}   [{', '.join(rs) if rs else 'no renderable assets'}]",
-                    value=name,
+            elif state == "PLOT_RUN":
+                res = run_plot_wizard()
+                if res == "__back__":
+                    state = "TASK"
+                else:
+                    return res
+
+            elif state == "VIDEO_RUN":
+                res = run_video_wizard()
+                if res == "__back__":
+                    state = "TASK"
+                else:
+                    return res
+
+            elif state == "INSPECT_SCENE":
+                scenes = list_scenes()
+                if not scenes:
+                    console.print(f"[red]No scene directories found under {DATA_ROOT}[/]")
+                    return 1
+                scene_table(scenes)
+                console.print()
+                scene_name = ask_select_with_back(
+                    "Scene:",
+                    [Choice(f"{name}   [{', '.join(rs) if rs else 'no renderable assets'}]", value=name) for name, rs in scenes],
+                    default=scene_name or scenes[0][0],
                 )
-                for name, rs in scenes
-            ],
-            default=scenes[0][0],
-        )
-        scene_renderers = dict(scenes)[scene_name]
-        if not scene_renderers:
-            console.print(
-                f"[red]Scene {scene_name!r} has no renderable assets "
-                f"(expected mesh.ply, gs.ply, or nerf/).[/]"
-            )
-            return 1
+                scene_renderers = dict(scenes)[scene_name]
+                if not scene_renderers:
+                    console.print(f"[red]Scene {scene_name!r} has no renderable assets.[/]")
+                    continue
+                state = "INSPECT_OPTIONS"
 
-        if task_key == "servo_frames":
-            cfg = build_servo_frames_config(controller, scene_name, scene_renderers)
-        else:
-            cfg = build_trajectory_config(controller, [scene_name], scene_renderers)
+            elif state == "INSPECT_OPTIONS":
+                res = run_inspect_wizard(scene_name, scene_renderers)
+                if res == "__back__":
+                    state = "INSPECT_SCENE"
+                else:
+                    return res
 
-    console.print()
-    console.print(
-        Panel(
-            Syntax(json.dumps(cfg, indent=2), "json", theme="ansi_dark"),
-            title="[bold]Generated config[/]",
-            border_style="cyan",
-        )
-    )
+            elif state == "CONTROLLER":
+                copied_cfg.clear()
+                controller = ask_select_with_back(
+                    "Controller:",
+                    [Choice(v, value=k) for k, v in CONTROLLERS.items()],
+                    default=controller,
+                )
+                state = "COPY_SETTINGS"
 
-    action = ask_select(
-        "Next:",
-        [
-            Choice("Write config + run now", value="run"),
-            Choice("Write config only (no run)", value="save"),
-            Choice("Abort (discard)", value="abort"),
-        ],
-        default="run",
-    )
+            elif state == "COPY_SETTINGS":
+                runs = discover_copy_runs(controller, limit=15)
+                choices = [Choice("None - start fresh", value={})]
+                for r in runs:
+                    choices.append(Choice(resume_label(r), value=r["resolved"]))
 
-    if action == "abort":
-        console.print("[yellow]aborted[/]")
-        return 0
+                selected_copy = ask_select_with_back(
+                    "Copy settings from previous run?",
+                    choices,
+                    default=choices[0]
+                )
+                copied_cfg.update(selected_copy)
 
-    config_path = write_config(cfg, task_key, scene_name)
-    console.print(
-        f"[green]✓[/] wrote [bold]{config_path.relative_to(PROJECT_ROOT)}[/]"
-    )
+                if copied_cfg:
+                    action = ask_select_with_back(
+                        "How to apply copied settings?",
+                        [
+                            Choice("Fast-forward (skip prompts for copied values)", value="fast"),
+                            Choice("Review and edit all settings manually", value="review")
+                        ],
+                        default="fast"
+                    )
+                    fast_forward = (action == "fast")
+                else:
+                    fast_forward = False
 
-    if action == "save":
-        console.print("[grey50]save-only mode; not running[/]")
-        return 0
+                if task_key == "compare_table":
+                    state = "QUESTIONS"
+                else:
+                    state = "SCENE"
 
-    command_name = TASKS[task_key]["command"]
-    console.rule(f"[bold green]Launching {command_name}[/]")
+            elif state == "SCENE":
+                scenes = list_scenes()
+                if not scenes:
+                    console.print(f"[red]No scene directories found under {DATA_ROOT}[/]")
+                    return 1
+                scene_table(scenes)
+                console.print()
+                scene_name = ask_select_with_back(
+                    "Scene:",
+                    [Choice(f"{name}   [{', '.join(rs) if rs else 'no renderable assets'}]", value=name) for name, rs in scenes],
+                    default=scene_name or scenes[0][0],
+                )
+                scene_renderers = dict(scenes)[scene_name]
+                if not scene_renderers:
+                    console.print(f"[red]Scene {scene_name!r} has no renderable assets.[/]")
+                    continue
+                state = "QUESTIONS"
 
-    runner_args = SimpleNamespace(
-        command=command_name,
-        config=str(config_path),
-        set=[],
-        resume=None,
-    )
-    SUBCOMMANDS[command_name]["runner"].run(runner_args)
-    return 0
+            elif state == "QUESTIONS":
+                if task_key == "compare_table":
+                    comparison_scenes = renderable_scenes(list_scenes())
+                    if not comparison_scenes:
+                        console.print("[red]No renderable datasets found under DATA/[/]")
+                        return 1
+                    comparison_datasets = [name for name, _ in comparison_scenes]
+                    scene_renderers = ordered_renderers(comparison_scenes, common=True)
+                    if not scene_renderers:
+                        scene_renderers = ordered_renderers(comparison_scenes, common=False)
+                        console.print("[yellow]No renderer is available in every dataset.[/]")
+                    console.print("[grey50]datasets:[/] " + ", ".join(comparison_datasets))
+                    scene_name = "all_datasets"
+                    cfg = build_trajectory_config(controller, comparison_datasets, scene_renderers, run_tag_default="compare_all")
+                else:
+                    if task_key == "servo_frames":
+                        cfg = build_servo_frames_config(controller, scene_name, scene_renderers)
+                    else:
+                        cfg = build_trajectory_config(controller, [scene_name], scene_renderers)
+
+                console.print()
+                console.print(
+                    Panel(
+                        Syntax(json.dumps(cfg, indent=2), "json", theme="ansi_dark"),
+                        title="[bold]Generated config[/]",
+                        border_style="cyan",
+                    )
+                )
+                state = "ACTION"
+
+            elif state == "ACTION":
+                action = ask_select_with_back(
+                    "Next:",
+                    [
+                        Choice("Write config + run now", value="run"),
+                        Choice("Write config only (no run)", value="save"),
+                        Choice("Abort (discard)", value="abort"),
+                    ],
+                    default="run",
+                )
+                if action == "abort":
+                    console.print("[yellow]aborted[/]")
+                    return 0
+
+                config_path = write_config(cfg, task_key, scene_name)
+                console.print(f"[green]✓[/] wrote [bold]{config_path.relative_to(PROJECT_ROOT)}[/]")
+
+                if action == "save":
+                    console.print("[grey50]save-only mode; not running[/]")
+                    return 0
+
+                command_name = TASKS[task_key]["command"]
+                console.rule(f"[bold green]Launching {command_name}[/]")
+
+                runner_args = SimpleNamespace(
+                    command=command_name,
+                    config=str(config_path),
+                    set=[],
+                    resume=None,
+                )
+                SUBCOMMANDS[command_name]["runner"].run(runner_args)
+                return 0
+
+        except GoBack:
+            back_map = {
+                "RESUME": "TASK",
+                "PLOT_RUN": "TASK",
+                "VIDEO_RUN": "TASK",
+                "INSPECT_SCENE": "TASK",
+                "INSPECT_OPTIONS": "INSPECT_SCENE",
+                "CONTROLLER": "TASK",
+                "COPY_SETTINGS": "CONTROLLER",
+                "SCENE": "COPY_SETTINGS",
+                "QUESTIONS": "COPY_SETTINGS" if task_key == "compare_table" else "SCENE",
+                "ACTION": "QUESTIONS",
+            }
+            state = back_map.get(state, "TASK")
 
 
 # ---- entry point -----------------------------------------------------------

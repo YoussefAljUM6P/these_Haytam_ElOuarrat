@@ -24,6 +24,8 @@ TRAJECTORY_CONFIG_KEYS = {
     "renderer": "RENDERER",
     "gs_model": "GS_MODEL",
     "nerf_render_scale": "NERF_RENDER_SCALE",
+    "gs_render_scale": "GS_RENDER_SCALE",
+    "mesh_render_scale": "MESH_RENDER_SCALE",
     "stride": "STRIDE",
     "mini_iterations": "MINI_ITERATIONS",
     "dt": "DT",
@@ -39,8 +41,12 @@ TRAJECTORY_CONFIG_KEYS = {
     "takes_jump_factor": "TAKES_JUMP_FACTOR",
     "stop_residual_px": "STOP_RESIDUAL_PX",
     "stop_mse_per_px": "STOP_MSE_PER_PX",
+    "stop_plateau_iters": "STOP_PLATEAU_ITERS",
+    "stop_plateau_ratio": "STOP_PLATEAU_RATIO",
     "diverge_residual_px": "DIVERGE_RESIDUAL_PX",
     "diverge_mse_per_px": "DIVERGE_MSE_PER_PX",
+    "diverge_translation_error": "DIVERGE_TRANSLATION_ERROR",
+    "diverge_rotation_error_deg": "DIVERGE_ROTATION_ERROR_DEG",
     "min_interaction_rank": "MIN_INTERACTION_RANK",
     "max_interaction_condition": "MAX_INTERACTION_CONDITION",
     "max_translation_step": "MAX_TRANSLATION_STEP",
@@ -76,6 +82,10 @@ SERVO_FRAMES_CONFIG_KEYS = {
     "run_name": "RUN_NAME",
     "stop_residual_px": "STOP_RESIDUAL_PX",
     "stop_mse_per_px": "STOP_MSE_PER_PX",
+    "diverge_translation_error": "DIVERGE_TRANSLATION_ERROR",
+    "diverge_rotation_error_deg": "DIVERGE_ROTATION_ERROR_DEG",
+    "stop_plateau_iters": "STOP_PLATEAU_ITERS",
+    "stop_plateau_ratio": "STOP_PLATEAU_RATIO",
     "min_interaction_rank": "MIN_INTERACTION_RANK",
     "max_interaction_condition": "MAX_INTERACTION_CONDITION",
     "max_translation_step": "MAX_TRANSLATION_STEP",
@@ -113,6 +123,9 @@ KIND_ALIASES = {
         "tag": "run_tag",
         "nerf_scale": "nerf_render_scale",
         "render_scale": "nerf_render_scale",
+        "diverge_tr_error": "diverge_translation_error",
+        "diverge_rot_error": "diverge_rotation_error_deg",
+        "diverge_rot_error_deg": "diverge_rotation_error_deg",
     },
     "servo_frames": {
         "dataset": "scene_dir",
@@ -122,6 +135,9 @@ KIND_ALIASES = {
         "away": "index_away",
         "iters": "iterations",
         "tag": "run_name",
+        "diverge_tr_error": "diverge_translation_error",
+        "diverge_rot_error": "diverge_rotation_error_deg",
+        "diverge_rot_error_deg": "diverge_rotation_error_deg",
     },
 }
 
@@ -145,12 +161,14 @@ INT_KEYS = {
     "photometric_max_pixels",
     "min_interaction_rank",
 }
-OPTIONAL_INT_KEYS = {"max_pairs", "target_index"}
+OPTIONAL_INT_KEYS = {"max_pairs", "target_index", "stop_plateau_iters"}
 FLOAT_KEYS = {
     "dt",
     "gain_ibvs",
     "gain_photo",
     "nerf_render_scale",
+    "gs_render_scale",
+    "mesh_render_scale",
     "stop_residual_px",
     "stop_mse_per_px",
     "diverge_residual_px",
@@ -159,6 +177,7 @@ FLOAT_KEYS = {
     "grad_percentile",
     "takes_jump_factor",
     "adaptive_step_fraction",
+    "stop_plateau_ratio",
 }
 OPTIONAL_FLOAT_KEYS = {
     "huber_k",
@@ -168,6 +187,8 @@ OPTIONAL_FLOAT_KEYS = {
     "max_rotation_step_deg",
     "hard_translation_step",
     "hard_rotation_step_deg",
+    "diverge_translation_error",
+    "diverge_rotation_error_deg",
 }
 BOOL_KEYS = {
     "save_task_viz",
@@ -288,8 +309,11 @@ def coerce_config_value(key, value):
         value = float(value)
         if key == "dt" and value <= 0.0:
             raise ValueError("dt must be > 0")
-        if key == "nerf_render_scale" and value <= 0.0:
-            raise ValueError("nerf_render_scale must be > 0")
+        if (
+            key in {"nerf_render_scale", "gs_render_scale", "mesh_render_scale"}
+            and value <= 0.0
+        ):
+            raise ValueError(f"{key} must be > 0")
         if key == "sigma_blur" and value < 0.0:
             raise ValueError("sigma_blur must be >= 0")
         if key == "grad_percentile" and not (0.0 <= value < 100.0):
@@ -315,6 +339,8 @@ def coerce_config_value(key, value):
             "max_rotation_step_deg",
             "hard_translation_step",
             "hard_rotation_step_deg",
+            "diverge_translation_error",
+            "diverge_rotation_error_deg",
         } and value <= 0.0:
             raise ValueError(f"{key} must be > 0 or null")
         return value

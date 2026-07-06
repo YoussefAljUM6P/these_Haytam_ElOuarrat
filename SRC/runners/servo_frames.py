@@ -8,7 +8,6 @@ this module can be imported by `cli.py` without pulling them in.
 """
 
 import csv
-import json
 import math
 import re
 from pathlib import Path
@@ -38,13 +37,15 @@ DEPTH_MODE = "intrinsic"  # "learned" = MoGe2, "intrinsic" = scene.render_depth(
 FEATURE_METHOD = "sift"
 VIZ_ITER = 1
 GAIN_IBVS = 0.75
-GAIN_PHOTO = 0.005
+GAIN_PHOTO = 0.75
 MIN_FEATURES = 3
 RATIO = 1
 RUN_NAME = None
 STOP_RESIDUAL_PX = 0.5      # IBVS: RMS reprojection error (px)
 STOP_MSE_PER_PX = 2.0e-6    # legacy photometric MSE; used when STOP_SSD is None
 STOP_SSD = None             # photometric: ViSP-style SSD threshold, or None
+DIVERGE_TRANSLATION_ERROR = 0.5  # final translation gap above which a task is "diverged"
+DIVERGE_ROTATION_ERROR_DEG = 30.0  # final rotation error above which a task is "diverged"
 MIN_INTERACTION_RANK = 6
 MAX_INTERACTION_CONDITION = 1.0e8
 MAX_TRANSLATION_STEP = 0.5
@@ -75,6 +76,24 @@ def add_arguments(parser):
         help=(
             "Override a config value. May be repeated, e.g. "
             "--set renderer=mesh --set scene=kitchen."
+        ),
+    )
+    parser.add_argument(
+        "--diverge-translation-error",
+        type=float,
+        default=None,
+        help=(
+            "Mark the task diverged if final translation error exceeds this. "
+            "Overrides config/--set diverge_translation_error."
+        ),
+    )
+    parser.add_argument(
+        "--diverge-rotation-error-deg",
+        type=float,
+        default=None,
+        help=(
+            "Mark the task diverged if final rotation error exceeds this many degrees. "
+            "Overrides config/--set diverge_rotation_error_deg."
         ),
     )
 
@@ -605,6 +624,12 @@ TRIAL_INDEX_FIELDS = [
     "target_index",
     "iterations_run",
     "stop_reason",
+    "fps",
+    "render_fps",
+    "iter_ms_mean",
+    "render_ms_mean",
+    "controller_ms_mean",
+    "loop_s",
     "initial_translation_gap",
     "final_translation_gap",
     "initial_rotation_error_deg",
@@ -639,6 +664,7 @@ def _summary_cell(value):
 
 
 def write_servo_summary_markdown(path, summary):
+    timing = summary.get("timing", {}) or {}
     rows = [
         ("Scene", Path(summary["scene_dir"]).name),
         ("Renderer", summary["renderer"]),
@@ -648,6 +674,9 @@ def write_servo_summary_markdown(path, summary):
         ("Feature", summary["feature_method"]),
         ("Iterations", f"{summary['iterations_run']}/{summary['iterations']}"),
         ("Stop", summary["stop_reason"]),
+        ("Average FPS", format_stat(timing.get("fps"), 2)),
+        ("Average render ms", format_stat(timing.get("render_ms_mean"), 2)),
+        ("Average iter ms", format_stat(timing.get("iter_ms_mean"), 2)),
         ("Translation gap", f"{format_stat(summary['initial_translation_gap'], 6)} -> {format_stat(summary['final_translation_gap'], 6)}"),
         ("Rotation gap", f"{format_stat(summary['initial_rotation_error_deg'], 4)}deg -> {format_stat(summary['final_rotation_error_deg'], 4)}deg"),
     ]
@@ -704,6 +733,16 @@ def experiment_config(
         "stop_residual_px": float(STOP_RESIDUAL_PX),
         "stop_mse_per_px": float(STOP_MSE_PER_PX),
         "stop_ssd": (None if STOP_SSD is None else float(STOP_SSD)),
+        "diverge_translation_error": (
+            None
+            if DIVERGE_TRANSLATION_ERROR is None
+            else float(DIVERGE_TRANSLATION_ERROR)
+        ),
+        "diverge_rotation_error_deg": (
+            None
+            if DIVERGE_ROTATION_ERROR_DEG is None
+            else float(DIVERGE_ROTATION_ERROR_DEG)
+        ),
         "min_interaction_rank": int(MIN_INTERACTION_RANK),
         "max_interaction_condition": (
             None
@@ -752,6 +791,16 @@ def run(args):
         SERVO_FRAMES_CONFIG_KEYS,
         "servo_frames",
     )
+    diverge_translation_error = getattr(args, "diverge_translation_error", None)
+    diverge_rotation_error_deg = getattr(args, "diverge_rotation_error_deg", None)
+    if diverge_translation_error is not None:
+        if diverge_translation_error <= 0.0:
+            raise ValueError("--diverge-translation-error must be > 0")
+        applied_config["diverge_translation_error"] = diverge_translation_error
+    if diverge_rotation_error_deg is not None:
+        if diverge_rotation_error_deg <= 0.0:
+            raise ValueError("--diverge-rotation-error-deg must be > 0")
+        applied_config["diverge_rotation_error_deg"] = diverge_rotation_error_deg
     apply_config(applied_config, globals(), SERVO_FRAMES_CONFIG_KEYS)
     if applied_config:
         print(f"Applied servo config: {format_applied_config(applied_config)}")
@@ -832,9 +881,7 @@ def run(args):
         DEPTH_MODE,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-    logs_dir = output_dir / "logs"
     visualizations_dir = output_dir / "visualizations"
-    logs_dir.mkdir(parents=True, exist_ok=True)
     visualizations_dir.mkdir(parents=True, exist_ok=True)
 
     target_image = load_rgb(target["rgb_path"], start_camera.W, start_camera.H)
@@ -891,7 +938,7 @@ def run(args):
         controller,
         iterations=ITERATIONS,
         dt=DT,
-        visualization_dir=visualizations_dir / "matches",
+        visualization_dir=visualizations_dir,
         matcher=matcher,
         feature_method=FEATURE_METHOD,
         iteration_callback=record_iteration_metrics,
@@ -910,19 +957,14 @@ def run(args):
         final_photometric_viz = save_current_desired_error_visualization(
             final_render,
             target_image,
-            visualizations_dir / "final_desired_error.png",
+            output_dir / "final_desired_error.png",
             current_label="final",
             desired_label="desired",
         )
     write_history_csv(output_dir / "history.csv", result["history"])
-    write_history_csv(logs_dir / "history.csv", result["history"])
     save_error_evolution(
         result["history"],
-        visualizations_dir / "error_evolution.png",
-    )
-    save_error_evolution(
-        result["history"],
-        logs_dir / "error_evolution.png",
+        output_dir / "error_evolution.png",
     )
 
     final_translation_gap = translation_gap(final_camera, target_camera)
@@ -953,9 +995,8 @@ def run(args):
         "depth": DEPTH_MODE,
         "feature_method": FEATURE_METHOD,
         "viz_iter": int(VIZ_ITER),
-        "logs_dir": str(logs_dir),
         "visualizations_dir": str(visualizations_dir),
-        "error_evolution_plot": str(logs_dir / "error_evolution.png"),
+        "error_evolution_plot": str(output_dir / "error_evolution.png"),
         "iterations": ITERATIONS,
         "dt": DT,
         "camera": camera_metadata(start_camera),
@@ -982,6 +1023,94 @@ def run(args):
         "history": history_for_json(result["history"]),
     }
 
+    # --- trajectory-format interop files -------------------------------------
+    # Emit the same canonical artifacts a trajectory run writes -- sim/gt TUM
+    # trajectories plus a one-row per_task_errors.csv -- so the plot, video and
+    # run-discovery tooling treats a servo-frames run as a single-task
+    # trajectory. The simulated trajectory is the per-iteration camera path; the
+    # "ground truth" is the fixed desired pose, so APE is the distance-to-target
+    # at each iteration.
+    import numpy as np
+    from runners.trajectory import PER_TASK_FIELDS, write_tum
+
+    hist = result["history"]
+    sim_poses = [start_camera.T_world_cam.copy()]
+    for item in hist:
+        sim_poses.append(np.asarray(item.get("next_T_world_cam", item["T_world_cam"])))
+    gt_poses = [target_T_world_cam.copy() for _ in sim_poses]
+    timestamps = list(range(len(sim_poses)))
+    sim_tum = output_dir / "sim_traj.tum"
+    gt_tum = output_dir / "gt_traj.tum"
+    write_tum(sim_tum, timestamps, sim_poses)
+    write_tum(gt_tum, timestamps, gt_poses)
+
+    last_info = hist[-1].get("controller_info", {}) if hist else {}
+    final_mse = float(
+        np.mean(
+            (np.asarray(final_render, dtype=np.float64)
+             - np.asarray(target_image, dtype=np.float64)) ** 2
+        )
+    )
+    feature_err_px = last_info.get("residual_rms_px")
+    final_residual = feature_err_px if CONTROLLER == "ibvs" else final_mse
+
+    pose_diverged = (
+        (
+            DIVERGE_TRANSLATION_ERROR is not None
+            and final_translation_gap > float(DIVERGE_TRANSLATION_ERROR)
+        )
+        or (
+            DIVERGE_ROTATION_ERROR_DEG is not None
+            and final_rotation_error > float(DIVERGE_ROTATION_ERROR_DEG)
+        )
+    )
+
+    pose_failure_type = "pose_diverged" if pose_diverged else ""
+
+    per_task_csv = output_dir / "per_task_errors.csv"
+    task_row = {
+        "task_index": 0,
+        "sequence_reset": 0,
+        "src_frame": start_frame,
+        "target_frame": target_frame,
+        "src_rgb": str(start["rgb_path"]),
+        "target_rgb": str(target["rgb_path"]),
+        "iterations_planned": int(ITERATIONS),
+        "iterations_run": len(hist),
+        "feature_err_px": feature_err_px if feature_err_px is not None else "",
+        "final_residual": final_residual if final_residual is not None else "",
+        "diverged": int(bool(last_info.get("fault_reason")) or pose_diverged),
+        "cut_to_desired": 0,
+        "failure_type": last_info.get("fault_reason") or pose_failure_type,
+        "stop_reason": result["stop_reason"],
+        "depth_valid_pixels": (depth_preflight_info or {}).get("valid_pixels", ""),
+        "depth_finite_ratio": (depth_preflight_info or {}).get("finite_ratio", ""),
+        "initial_translation_gap": initial_translation_gap,
+        "initial_rotation_gap_deg": initial_rotation_error,
+        "translation_gap": final_translation_gap,
+        "rotation_error_deg": final_rotation_error,
+        "fps": result.get("timing", {}).get("fps", 0.0),
+        "render_fps": result.get("timing", {}).get("render_fps", 0.0),
+        "iter_ms_mean": result.get("timing", {}).get("iter_ms_mean", 0.0),
+        "render_ms_mean": result.get("timing", {}).get("render_ms_mean", 0.0),
+        "controller_ms_mean": result.get("timing", {}).get("controller_ms_mean", 0.0),
+        "loop_s": result.get("timing", {}).get("loop_s", 0.0),
+        # Left blank on purpose: a servo-frames run has one task but many
+        # per-iteration frames in visualizations/. An empty viz_path makes the
+        # video tool fall back to globbing visualizations/*.png and compile the
+        # full convergence animation instead of a single manifest frame.
+        "viz_path": "",
+    }
+    with open(per_task_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=PER_TASK_FIELDS)
+        writer.writeheader()
+        writer.writerow({k: task_row.get(k, "") for k in PER_TASK_FIELDS})
+
+    summary["num_tasks"] = 1
+    summary["sim_traj"] = str(sim_tum)
+    summary["gt_traj"] = str(gt_tum)
+    summary["per_task_csv"] = str(per_task_csv)
+
     write_run_json(output_dir / "summary.json", summary)
     write_run_json(output_dir / "config.resolved.json", summary["config"])
     write_run_json(output_dir / "config.json", summary["config"])
@@ -1003,11 +1132,11 @@ def run(args):
             ("machine summary", "summary.json"),
             ("resolved config", "config.resolved.json"),
             ("history", "history.csv"),
+            ("trajectories", "sim_traj.tum, gt_traj.tum"),
+            ("per-task errors", "per_task_errors.csv"),
             ("visualizations", "visualizations/"),
         ],
     )
-    write_run_json(logs_dir / "summary.json", summary)
-    write_run_json(logs_dir / "config.json", summary["config"])
 
     append_trial_index(trial_dir, {
         "run_dir": output_dir.name,
@@ -1028,6 +1157,8 @@ def run(args):
         "render_fps": float(result.get("timing", {}).get("render_fps", 0.0)),
         "iter_ms_mean": float(result.get("timing", {}).get("iter_ms_mean", 0.0)),
         "render_ms_mean": float(result.get("timing", {}).get("render_ms_mean", 0.0)),
+        "controller_ms_mean": float(result.get("timing", {}).get("controller_ms_mean", 0.0)),
+        "loop_s": float(result.get("timing", {}).get("loop_s", 0.0)),
         "initial_translation_gap": initial_translation_gap,
         "final_translation_gap": final_translation_gap,
         "initial_rotation_error_deg": initial_rotation_error,

@@ -12,6 +12,7 @@ Use via the CLI:
 
 import csv
 import json
+import math
 import sys
 import traceback
 from pathlib import Path
@@ -49,14 +50,16 @@ DATASETS = ["living"]
 RENDERER = "gs"
 GS_MODEL = "standard"  # "standard" -> gs.ply, "moge" -> gs_moge.ply
 NERF_RENDER_SCALE = 0.25
+GS_RENDER_SCALE = 1.0
+MESH_RENDER_SCALE = 1.0
 STRIDE = 1
-MINI_ITERATIONS = 10
+MINI_ITERATIONS = 500
 DT = 1.0
 DEPTH_MODE = "intrinsic"
 FEATURE_METHOD = "sift"
 RUN_TAG = "GS_SIFT_INTRINSIC"
 GAIN_IBVS = 0.75
-GAIN_PHOTO = 0.005
+GAIN_PHOTO = 0.75
 MIN_FEATURES = 3
 RATIO = 1
 START_INDEX = 1
@@ -70,9 +73,11 @@ TAKES_JUMP_FACTOR = 5.0
 STOP_RESIDUAL_PX = 0.5      # IBVS: RMS reprojection error (px)
 STOP_MSE_PER_PX = 2.0e-6    # legacy photometric MSE; used when STOP_SSD is None
 STOP_SSD = None             # photometric: ViSP-style SSD threshold, or None
-# Per-task divergence abort thresholds (checked on the final residual).
+# Per-task divergence abort thresholds. Set pose thresholds to None to disable.
 DIVERGE_RESIDUAL_PX = 1000.0  # IBVS: feature error (px) above which a task is "diverged"
 DIVERGE_MSE_PER_PX = 0.01     # photometric: image MSE/px above which a task is "diverged"
+DIVERGE_TRANSLATION_ERROR = 0.5  # final translation gap above which a task is "diverged"
+DIVERGE_ROTATION_ERROR_DEG = 30.0  # final rotation error above which a task is "diverged"
 MIN_INTERACTION_RANK = 6
 MAX_INTERACTION_CONDITION = 1.0e8
 MAX_TRANSLATION_STEP = 0.5
@@ -121,6 +126,25 @@ def _dynamic_n_iter(w: float, n1: int) -> int:
     if w < 1.0 / 3.0:
         return max(1, n1 // 3)
     return max(1, int(round(w * n1)))
+
+def _is_cuda_out_of_memory(exc):
+    markers = (
+        "cuda out of memory",
+        "cuda_error_out_of_memory",
+        "outofmemoryerror",
+        "cumemcreate",
+        "cublas_status_alloc_failed",
+    )
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = f"{type(current).__name__}: {current}".lower()
+        if any(marker in text for marker in markers):
+            return True
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+    return False
+
 
 CONTROLLER = "ibvs"
 SIGMA_BLUR = 1.0
@@ -173,6 +197,24 @@ def add_arguments(parser):
         help=(
             "IBVS trajectory abort threshold on final feature residual in pixels. "
             "Overrides config/--set diverge_residual_px."
+        ),
+    )
+    parser.add_argument(
+        "--diverge-translation-error",
+        type=float,
+        default=None,
+        help=(
+            "Trajectory abort threshold on final translation error. "
+            "Overrides config/--set diverge_translation_error."
+        ),
+    )
+    parser.add_argument(
+        "--diverge-rotation-error-deg",
+        type=float,
+        default=None,
+        help=(
+            "Trajectory abort threshold on final rotation error in degrees. "
+            "Overrides config/--set diverge_rotation_error_deg."
         ),
     )
     parser.add_argument(
@@ -276,11 +318,19 @@ def build_trajectory_tasks(frame_ids, takes=None):
     return tasks
 
 
+def _apply_scale(records, scale, label):
+    records = scale_frame_records(records, scale)
+    if float(scale) != 1.0:
+        print(f"Using {label} render scale {float(scale):g}")
+    return records
+
+
 def load_trajectory_scene_and_frames(scene_dir):
     from dataset import load_colmap
 
     records = load_colmap(scene_dir)
     if RENDERER == "mesh":
+        records = _apply_scale(records, MESH_RENDER_SCALE, "mesh")
         from scenes.mesh import MeshScene
         mesh_path = scene_dir / "mesh.ply"
         if not mesh_path.exists():
@@ -288,6 +338,7 @@ def load_trajectory_scene_and_frames(scene_dir):
         print(f"Using mesh {mesh_path}")
         scene = MeshScene(mesh_path)
     elif RENDERER == "gs":
+        records = _apply_scale(records, GS_RENDER_SCALE, "gs")
         from scenes.gs import GSScene
         ply_path = scene_dir / ("gs_moge.ply" if GS_MODEL == "moge" else "gs.ply")
         if not ply_path.exists():
@@ -296,9 +347,7 @@ def load_trajectory_scene_and_frames(scene_dir):
             print(f"Using MoGe depth-supervised GS {ply_path}")
         scene = GSScene(ply_path)
     elif RENDERER == "nerf":
-        records = scale_frame_records(records, NERF_RENDER_SCALE)
-        if float(NERF_RENDER_SCALE) != 1.0:
-            print(f"Using NeRF render scale {float(NERF_RENDER_SCALE):g}")
+        records = _apply_scale(records, NERF_RENDER_SCALE, "NeRF")
         from scenes.nerf import NeRFScene
         scene = NeRFScene(scene_dir)
     else:
@@ -528,6 +577,95 @@ def read_per_task_csv(path):
     return rows
 
 
+def _finite_float(value):
+    if value in (None, ""):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
+    return out
+
+
+def _positive_int(value):
+    out = _finite_float(value)
+    if out is None or out <= 0:
+        return 0
+    return int(out)
+
+
+def summarize_task_timing(rows):
+    weighted_keys = ("iter_ms_mean", "render_ms_mean", "controller_ms_mean")
+    weighted_sums = {key: 0.0 for key in weighted_keys}
+    weighted_counts = {key: 0 for key in weighted_keys}
+
+    total_iters = 0
+    total_loop_s = 0.0
+    fps_weighted_sum = 0.0
+    fps_weighted_count = 0
+    num_timed_tasks = 0
+
+    for row in rows:
+        iterations = _positive_int(row.get("iterations_run"))
+        if iterations <= 0:
+            continue
+
+        total_iters += iterations
+        row_has_timing = False
+
+        loop_s = _finite_float(row.get("loop_s"))
+        if loop_s is not None and loop_s > 0.0:
+            total_loop_s += loop_s
+            row_has_timing = True
+
+        fps = _finite_float(row.get("fps"))
+        if fps is not None and fps > 0.0:
+            fps_weighted_sum += fps * iterations
+            fps_weighted_count += iterations
+            row_has_timing = True
+
+        for key in weighted_keys:
+            value = _finite_float(row.get(key))
+            if value is None or value < 0.0:
+                continue
+            weighted_sums[key] += value * iterations
+            weighted_counts[key] += iterations
+            row_has_timing = True
+
+        if row_has_timing:
+            num_timed_tasks += 1
+
+    timing = {
+        "num_tasks": int(len(rows)),
+        "num_timed_tasks": int(num_timed_tasks),
+        "iterations_run": int(total_iters),
+        "loop_s": float(total_loop_s),
+    }
+
+    for key in weighted_keys:
+        count = weighted_counts[key]
+        timing[key] = float(weighted_sums[key] / count) if count else 0.0
+
+    if total_loop_s > 0.0:
+        fps = float(total_iters / total_loop_s)
+    elif fps_weighted_count:
+        fps = float(fps_weighted_sum / fps_weighted_count)
+    else:
+        fps = 0.0
+
+    timing["fps"] = fps
+    timing["render_fps"] = (
+        float(1000.0 / timing["render_ms_mean"])
+        if timing["render_ms_mean"] > 0.0
+        else 0.0
+    )
+    timing["avg_fps"] = timing["fps"]
+    timing["avg_render_ms"] = timing["render_ms_mean"]
+    return timing
+
+
 def read_tum(path):
     import numpy as np
     from scipy.spatial.transform import Rotation
@@ -586,6 +724,15 @@ def _summary_metric(scene_summary, family, key):
     return values.get(key)
 
 
+def _summary_timing(scene_summary, key):
+    if not isinstance(scene_summary, dict):
+        return None
+    timing = scene_summary.get("timing", {})
+    if not isinstance(timing, dict):
+        return None
+    return timing.get(key)
+
+
 def _summary_status(scene_summary):
     if not isinstance(scene_summary, dict):
         return "failed"
@@ -618,6 +765,8 @@ def write_trajectory_summary_markdown(path, overall):
         "APE rot RMSE deg",
         "RPE trans RMSE",
         "RPE rot RMSE deg",
+        "Avg FPS",
+        "Avg render ms",
         "Error",
     ]]
     for scene_name, scene_summary in overall.items():
@@ -644,6 +793,8 @@ def write_trajectory_summary_markdown(path, overall):
             _format_summary_value(
                 _summary_metric(scene_summary, "rpe_rotation_deg", "rmse")
             ),
+            _format_summary_value(_summary_timing(scene_summary, "fps")),
+            _format_summary_value(_summary_timing(scene_summary, "render_ms_mean")),
             _summary_error(scene_summary),
         ])
 
@@ -686,6 +837,8 @@ def resolved_trajectory_config(tag, run_root):
         "datasets": list(DATASETS),
         "renderer": RENDERER,
         "nerf_render_scale": float(NERF_RENDER_SCALE),
+        "gs_render_scale": float(GS_RENDER_SCALE),
+        "mesh_render_scale": float(MESH_RENDER_SCALE),
         "stride": int(STRIDE),
         "mini_iterations": int(MINI_ITERATIONS),
         "dt": float(DT),
@@ -705,6 +858,16 @@ def resolved_trajectory_config(tag, run_root):
         "stop_ssd": None if STOP_SSD is None else float(STOP_SSD),
         "diverge_residual_px": float(DIVERGE_RESIDUAL_PX),
         "diverge_mse_per_px": float(DIVERGE_MSE_PER_PX),
+        "diverge_translation_error": (
+            None
+            if DIVERGE_TRANSLATION_ERROR is None
+            else float(DIVERGE_TRANSLATION_ERROR)
+        ),
+        "diverge_rotation_error_deg": (
+            None
+            if DIVERGE_ROTATION_ERROR_DEG is None
+            else float(DIVERGE_ROTATION_ERROR_DEG)
+        ),
         "min_interaction_rank": int(MIN_INTERACTION_RANK),
         "max_interaction_condition": (
             None
@@ -1023,6 +1186,16 @@ def run_scene(scene_name, run_root, resume=False):
             except OSError:
                 pass
 
+            if _is_cuda_out_of_memory(e):
+                print(
+                    f"[{scene_name}] task {task_idx:04d} hit CUDA out-of-memory "
+                    f"({type(e).__name__}: {e}); stopping scene instead of "
+                    f"cutting through remaining tasks. Last successful task: "
+                    f"{per_task_rows[-1]['task_index'] if per_task_rows else 'none'}. "
+                    f"Proceeding to evaluation on completed tasks."
+                )
+                break
+
             if not CONTINUE_ON_TASK_FAILURE:
                 print(
                     f"[{scene_name}] task {task_idx:04d} FAILED ({type(e).__name__}: {e}); "
@@ -1174,15 +1347,48 @@ def run_scene(scene_name, run_root, resume=False):
             final_rendered = scene.render(final_camera)
         final_resid = _residual(final_rendered, target_image, final_camera)
 
+        last_history = result["history"][-1] if result["history"] else {}
+        last_info = last_history.get("controller_info", {})
+        fault_reason = last_info.get("fault_reason")
+
+        # A controller fault (e.g. no usable pixels/features found because the
+        # camera renders empty geometry) or a non-finite residual is a failure,
+        # not convergence. NaN slips past `final_resid > threshold`, so flag it
+        # explicitly and route it through the diverged cut/abort path below
+        # instead of silently recording a frozen task.
         threshold = _diverge_threshold()
-        diverged = final_resid > threshold
+        no_features = bool(fault_reason) or not np.isfinite(final_resid)
+        residual_diverged = final_resid > threshold
+        failure_reasons = []
+        if residual_diverged:
+            failure_reasons.append(
+                f"{_residual_label()}={_fmt_residual(final_resid)} > "
+                f"{_fmt_residual(threshold)}"
+            )
+        if (
+            DIVERGE_TRANSLATION_ERROR is not None
+            and np.isfinite(translation_err)
+            and translation_err > float(DIVERGE_TRANSLATION_ERROR)
+        ):
+            failure_reasons.append(
+                f"tr_error={format_stat(translation_err, 6)} > "
+                f"{format_stat(DIVERGE_TRANSLATION_ERROR, 6)}"
+            )
+        if (
+            DIVERGE_ROTATION_ERROR_DEG is not None
+            and np.isfinite(rotation_err)
+            and rotation_err > float(DIVERGE_ROTATION_ERROR_DEG)
+        ):
+            failure_reasons.append(
+                f"rot_error={format_stat(rotation_err, 3)}deg > "
+                f"{format_stat(DIVERGE_ROTATION_ERROR_DEG, 3)}deg"
+            )
+        diverged = no_features or bool(failure_reasons)
 
         task_row["final_residual"] = float(final_resid)
         task_row["diverged"] = int(bool(diverged))
 
         diverge_tag = " DIVERGED" if diverged else ""
-        last_history = result["history"][-1] if result["history"] else {}
-        last_info = last_history.get("controller_info", {})
         _, err_value = controller_error_display(last_info)
         # E/F: final feature-error magnitude per matched feature.
         num_feats = last_info.get("num_inlier_matches") or 0
@@ -1211,14 +1417,17 @@ def run_scene(scene_name, run_root, resume=False):
         )
 
         if diverged:
+            if no_features:
+                fail_type = fault_reason or "no_features"
+                fail_desc = f"controller fault ({fail_type})"
+            else:
+                fail_type = "diverged"
+                fail_desc = "; ".join(failure_reasons)
             if CONTINUE_ON_TASK_FAILURE:
                 task_row["cut_to_desired"] = 1
-                task_row["failure_type"] = "diverged"
-                task_row["failure_message"] = (
-                    f"{_residual_label()}={_fmt_residual(final_resid)} > "
-                    f"{_fmt_residual(threshold)}"
-                )
-                task_row["stop_reason"] = "cut_after_diverged"
+                task_row["failure_type"] = fail_type
+                task_row["failure_message"] = fail_desc
+                task_row["stop_reason"] = f"cut_after_{fail_type}"
                 task_row["pre_cut_translation_gap"] = float(translation_err)
                 task_row["pre_cut_rotation_error_deg"] = float(rotation_err)
                 sim_poses[-1] = gt_T.copy()
@@ -1232,17 +1441,16 @@ def run_scene(scene_name, run_root, resume=False):
                 current_camera = copy_camera_with_pose(target_camera, gt_T)
                 baseline_feature_err_px = None
                 print(
-                    f"[{scene_name}] DIVERGED at task {task_idx:04d}: "
-                    f"{_residual_label()}={_fmt_residual(final_resid)} > "
-                    f"{_fmt_residual(threshold)}. Cutting to {tgt_frame_id} desired pose and continuing."
+                    f"[{scene_name}] FAILED at task {task_idx:04d}: {fail_desc}. "
+                    f"Cutting to {tgt_frame_id} desired pose and continuing."
                 )
                 continue
 
+            task_row["failure_type"] = fail_type
+            task_row["failure_message"] = fail_desc
             append_task_row(csv_path, task_row)
             print(
-                f"[{scene_name}] DIVERGED at task {task_idx:04d}: "
-                f"{_residual_label()}={_fmt_residual(final_resid)} > "
-                f"{_fmt_residual(threshold)}. Aborting run."
+                f"[{scene_name}] FAILED at task {task_idx:04d}: {fail_desc}. Aborting run."
             )
             raise SystemExit(1)
 
@@ -1272,10 +1480,17 @@ def run_scene(scene_name, run_root, resume=False):
 
     num_corrected = sum(_is_corrected(row) for row in per_task_rows)
     num_converged = len(per_task_rows) - num_corrected
+    timing = summarize_task_timing(per_task_rows)
+    timing_str = color(
+        f"avg_fps={timing['fps']:.1f} "
+        f"avg_render_ms={timing['render_ms_mean']:.2f}",
+        "magenta",
+    )
     print(
         f"\n=== {scene_name} completed tasks ({len(per_task_rows)} total) ===\n"
         f"  converged: {num_converged}\n"
-        f"  failed (corrected): {num_corrected}"
+        f"  failed (corrected): {num_corrected}\n"
+        f"  timing: {timing_str}"
     )
 
     summary = {
@@ -1284,6 +1499,8 @@ def run_scene(scene_name, run_root, resume=False):
         "renderer": RENDERER,
         "controller": CONTROLLER,
         "nerf_render_scale": float(NERF_RENDER_SCALE),
+        "gs_render_scale": float(GS_RENDER_SCALE),
+        "mesh_render_scale": float(MESH_RENDER_SCALE),
         "mesh_path": (
             str(scene_dir / "mesh.ply") if RENDERER == "mesh" else None
         ),
@@ -1301,6 +1518,16 @@ def run_scene(scene_name, run_root, resume=False):
         "stop_ssd": (None if STOP_SSD is None else float(STOP_SSD)),
         "diverge_residual_px": float(DIVERGE_RESIDUAL_PX),
         "diverge_mse_per_px": float(DIVERGE_MSE_PER_PX),
+        "diverge_translation_error": (
+            None
+            if DIVERGE_TRANSLATION_ERROR is None
+            else float(DIVERGE_TRANSLATION_ERROR)
+        ),
+        "diverge_rotation_error_deg": (
+            None
+            if DIVERGE_ROTATION_ERROR_DEG is None
+            else float(DIVERGE_ROTATION_ERROR_DEG)
+        ),
         "min_interaction_rank": int(MIN_INTERACTION_RANK),
         "max_interaction_condition": (
             None
@@ -1329,6 +1556,7 @@ def run_scene(scene_name, run_root, resume=False):
         "num_cuts": num_corrected,
         "num_converged": num_converged,
         "num_failed_corrected": num_corrected,
+        "timing": timing,
         "camera": camera_metadata(initial_camera),
         "sim_traj": str(sim_tum),
         "gt_traj": str(gt_tum),
@@ -1356,6 +1584,8 @@ def run(args):
     )
     diverge_mse_per_px = getattr(args, "diverge_mse_per_px", None)
     diverge_residual_px = getattr(args, "diverge_residual_px", None)
+    diverge_translation_error = getattr(args, "diverge_translation_error", None)
+    diverge_rotation_error_deg = getattr(args, "diverge_rotation_error_deg", None)
     if diverge_mse_per_px is not None:
         if diverge_mse_per_px <= 0.0:
             raise ValueError("--diverge-mse-per-px must be > 0")
@@ -1364,6 +1594,14 @@ def run(args):
         if diverge_residual_px <= 0.0:
             raise ValueError("--diverge-residual-px must be > 0")
         applied_config["diverge_residual_px"] = diverge_residual_px
+    if diverge_translation_error is not None:
+        if diverge_translation_error <= 0.0:
+            raise ValueError("--diverge-translation-error must be > 0")
+        applied_config["diverge_translation_error"] = diverge_translation_error
+    if diverge_rotation_error_deg is not None:
+        if diverge_rotation_error_deg <= 0.0:
+            raise ValueError("--diverge-rotation-error-deg must be > 0")
+        applied_config["diverge_rotation_error_deg"] = diverge_rotation_error_deg
     if getattr(args, "continue_on_task_failure", None) is not None:
         applied_config["continue_on_task_failure"] = bool(args.continue_on_task_failure)
     apply_config(applied_config, globals(), TRAJECTORY_CONFIG_KEYS)
@@ -1425,6 +1663,11 @@ def run(args):
                 print(f"Resuming run: {run_root}")
 
         run_root.mkdir(parents=True, exist_ok=True)
+        write_run_json(
+            run_root / "config.resolved.json",
+            resolved_trajectory_config(tag, run_root),
+        )
+        write_command(run_root / "command.txt")
 
         try:
             result = run_scene(scene_name, run_root, resume=scene_resume)
