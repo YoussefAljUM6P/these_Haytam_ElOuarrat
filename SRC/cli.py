@@ -439,6 +439,76 @@ def wizard():
             return False
         return True
 
+    _MANUAL_RUN = "__manual_run_path__"
+
+    def run_choice_label(info):
+        when = datetime.fromtimestamp(info["mtime"]).strftime("%Y-%m-%d %H:%M")
+        return f"{when}  {info['path'].relative_to(PROJECT_ROOT)}  [{info['scene']}]"
+
+    def _resolve_run_path(raw):
+        """Resolve a user-typed run path to an existing directory.
+
+        Accepts an absolute path, a ``~`` path, or a path relative to either
+        the project root or ``RUNS/`` (so both ``RUNS/FOO`` and ``FOO`` work).
+        Returns the resolved directory, or None if nothing matches.
+        """
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        p = Path(raw).expanduser()
+        candidates = [p] if p.is_absolute() else [p, PROJECT_ROOT / p, RUNS_ROOT / p]
+        for cand in candidates:
+            if cand.is_dir():
+                return cand.resolve()
+        return None
+
+    def select_run(message, runs, choice_label, requires=(), validate=None):
+        """Run picker with a 'enter a path manually' escape hatch.
+
+        Shows the discovered ``runs`` plus a "📁 Enter a run path manually…"
+        choice. Picking that prompts for a path (absolute / ~ / relative to
+        RUNS/), checks it contains every file in ``requires`` and passes the
+        optional ``validate(info) -> error_or_None`` gate, then returns a fresh
+        ``build_resume_info`` dict — same shape the discover_* functions yield.
+        A blank path goes back. Listed runs are returned as-is. Raises GoBack
+        on « Back.
+        """
+        choices = [Choice(choice_label(info), value=info) for info in runs]
+        choices.append(Choice("📁 Enter a run path manually…", value=_MANUAL_RUN))
+        selected = ask_select_with_back(
+            message, choices, default=(runs[0] if runs else None)
+        )
+        if selected is not _MANUAL_RUN:
+            return selected
+
+        while True:
+            raw = ask_text(
+                "Run path (absolute, ~, or relative to RUNS/; blank = back):",
+                None,
+                str,
+                optional=True,
+            )
+            if raw is None:
+                raise GoBack()
+            run_dir = _resolve_run_path(raw)
+            if run_dir is None:
+                console.print(f"[red]No such directory:[/] {raw}")
+                continue
+            missing = [name for name in requires if not (run_dir / name).exists()]
+            if missing:
+                console.print(
+                    f"[red]{run_dir} is missing required file(s):[/] "
+                    f"{', '.join(missing)}"
+                )
+                continue
+            info = build_resume_info(run_dir)
+            if validate is not None:
+                err = validate(info)
+                if err:
+                    console.print(f"[red]{err}[/]")
+                    continue
+            return info
+
     def discover_resume_runs(limit=15):
         runs_root = PROJECT_ROOT / "RUNS"
         if not runs_root.is_dir():
@@ -506,53 +576,65 @@ def wizard():
         runs = discover_resume_runs(limit=15)
         if not runs:
             console.print(
-                f"[red]No resumable trajectory runs found under {PROJECT_ROOT / 'RUNS'}[/]"
+                f"[yellow]No resumable trajectory runs auto-detected under "
+                f"{PROJECT_ROOT / 'RUNS'}; you can still enter a run path manually.[/]"
             )
-            return 1
 
-        table = Table(
-            title="Last 15 Resumable Trajectory Runs",
-            title_style="bold cyan",
-            border_style="grey50",
-            header_style="bold",
-        )
-        table.add_column("#", justify="right", style="cyan")
-        table.add_column("modified", style="green")
-        table.add_column("run")
-        table.add_column("scene")
-        table.add_column("method")
-        table.add_column("progress", justify="right")
-        for idx, info in enumerate(runs, start=1):
-            cfg = info["resolved"]
-            progress = info["progress"]
-            method = "/".join(
-                str(part)
-                for part in (
-                    cfg.get("renderer", "?"),
-                    cfg.get("controller", "?"),
-                    cfg.get("depth_mode", "?"),
-                    cfg.get("feature_method") if cfg.get("controller") == "ibvs" else None,
+        if runs:
+            table = Table(
+                title="Last 15 Resumable Trajectory Runs",
+                title_style="bold cyan",
+                border_style="grey50",
+                header_style="bold",
+            )
+            table.add_column("#", justify="right", style="cyan")
+            table.add_column("modified", style="green")
+            table.add_column("run")
+            table.add_column("scene")
+            table.add_column("method")
+            table.add_column("progress", justify="right")
+            for idx, info in enumerate(runs, start=1):
+                cfg = info["resolved"]
+                progress = info["progress"]
+                method = "/".join(
+                    str(part)
+                    for part in (
+                        cfg.get("renderer", "?"),
+                        cfg.get("controller", "?"),
+                        cfg.get("depth_mode", "?"),
+                        cfg.get("feature_method") if cfg.get("controller") == "ibvs" else None,
+                    )
+                    if part is not None
                 )
-                if part is not None
-            )
-            progress_text = str(progress["tasks_done"])
-            if progress["last_failure"]:
-                progress_text += f" ({progress['last_failure']})"
-            table.add_row(
-                str(idx),
-                datetime.fromtimestamp(info["mtime"]).strftime("%Y-%m-%d %H:%M"),
-                str(info["path"].relative_to(PROJECT_ROOT)),
-                info["scene"],
-                method,
-                progress_text,
-            )
-        console.print(table)
+                progress_text = str(progress["tasks_done"])
+                if progress["last_failure"]:
+                    progress_text += f" ({progress['last_failure']})"
+                table.add_row(
+                    str(idx),
+                    datetime.fromtimestamp(info["mtime"]).strftime("%Y-%m-%d %H:%M"),
+                    str(info["path"].relative_to(PROJECT_ROOT)),
+                    info["scene"],
+                    method,
+                    progress_text,
+                )
+            console.print(table)
 
         try:
-            selected = ask_select_with_back(
+            selected = select_run(
                 "Resume run:",
-                [Choice(resume_label(info), value=info) for info in runs],
-                default=runs[0],
+                runs,
+                resume_label,
+                requires=(
+                    "config.resolved.json",
+                    "per_task_errors.csv",
+                    "sim_traj.tum",
+                    "gt_traj.tum",
+                ),
+                validate=lambda info: (
+                    None
+                    if has_resume_config(info)
+                    else "That run has no usable trajectory config (missing keys)."
+                ),
             )
         except GoBack:
             return "__back__"
@@ -770,42 +852,36 @@ def wizard():
         runs = discover_plot_runs(limit=15)
         if not runs:
             console.print(
-                f"[red]No runs with sim_traj.tum + gt_traj.tum found under "
-                f"{PROJECT_ROOT / 'RUNS'}[/]"
+                f"[yellow]No runs with sim_traj.tum + gt_traj.tum auto-detected under "
+                f"{PROJECT_ROOT / 'RUNS'}; you can still enter a run path manually.[/]"
             )
-            return 1
 
-        table = Table(
-            title="Last 15 Runs Available for Plotting",
-            title_style="bold cyan",
-            border_style="grey50",
-            header_style="bold",
-        )
-        table.add_column("#", justify="right", style="cyan")
-        table.add_column("modified", style="green")
-        table.add_column("run")
-        table.add_column("scene")
-        for idx, info in enumerate(runs, start=1):
-            table.add_row(
-                str(idx),
-                datetime.fromtimestamp(info["mtime"]).strftime("%Y-%m-%d %H:%M"),
-                str(info["path"].relative_to(PROJECT_ROOT)),
-                info["scene"],
+        if runs:
+            table = Table(
+                title="Last 15 Runs Available for Plotting",
+                title_style="bold cyan",
+                border_style="grey50",
+                header_style="bold",
             )
-        console.print(table)
+            table.add_column("#", justify="right", style="cyan")
+            table.add_column("modified", style="green")
+            table.add_column("run")
+            table.add_column("scene")
+            for idx, info in enumerate(runs, start=1):
+                table.add_row(
+                    str(idx),
+                    datetime.fromtimestamp(info["mtime"]).strftime("%Y-%m-%d %H:%M"),
+                    str(info["path"].relative_to(PROJECT_ROOT)),
+                    info["scene"],
+                )
+            console.print(table)
 
         try:
-            selected = ask_select_with_back(
+            selected = select_run(
                 "Plot run:",
-                [
-                    Choice(
-                        f"{datetime.fromtimestamp(info['mtime']).strftime('%Y-%m-%d %H:%M')}"
-                        f"  {info['path'].relative_to(PROJECT_ROOT)}  [{info['scene']}]",
-                        value=info,
-                    )
-                    for info in runs
-                ],
-                default=runs[0],
+                runs,
+                run_choice_label,
+                requires=("sim_traj.tum", "gt_traj.tum"),
             )
             rpe_delta = ask_text("RPE delta (frames):", 1, int)
             out = ask_text(
@@ -854,42 +930,40 @@ def wizard():
         runs = discover_video_runs(limit=15)
         if not runs:
             console.print(
-                f"[red]No runs with saved visualizations found under "
-                f"{PROJECT_ROOT / 'RUNS'}[/]"
+                f"[yellow]No runs with saved visualizations auto-detected under "
+                f"{PROJECT_ROOT / 'RUNS'}; you can still enter a run path manually.[/]"
             )
-            return 1
 
-        table = Table(
-            title="Last 15 Runs Available for Video",
-            title_style="bold cyan",
-            border_style="grey50",
-            header_style="bold",
-        )
-        table.add_column("#", justify="right", style="cyan")
-        table.add_column("modified", style="green")
-        table.add_column("run")
-        table.add_column("scene")
-        for idx, info in enumerate(runs, start=1):
-            table.add_row(
-                str(idx),
-                datetime.fromtimestamp(info["mtime"]).strftime("%Y-%m-%d %H:%M"),
-                str(info["path"].relative_to(PROJECT_ROOT)),
-                info["scene"],
+        if runs:
+            table = Table(
+                title="Last 15 Runs Available for Video",
+                title_style="bold cyan",
+                border_style="grey50",
+                header_style="bold",
             )
-        console.print(table)
+            table.add_column("#", justify="right", style="cyan")
+            table.add_column("modified", style="green")
+            table.add_column("run")
+            table.add_column("scene")
+            for idx, info in enumerate(runs, start=1):
+                table.add_row(
+                    str(idx),
+                    datetime.fromtimestamp(info["mtime"]).strftime("%Y-%m-%d %H:%M"),
+                    str(info["path"].relative_to(PROJECT_ROOT)),
+                    info["scene"],
+                )
+            console.print(table)
 
         try:
-            selected = ask_select_with_back(
+            selected = select_run(
                 "Video run:",
-                [
-                    Choice(
-                        f"{datetime.fromtimestamp(info['mtime']).strftime('%Y-%m-%d %H:%M')}"
-                        f"  {info['path'].relative_to(PROJECT_ROOT)}  [{info['scene']}]",
-                        value=info,
-                    )
-                    for info in runs
-                ],
-                default=runs[0],
+                runs,
+                run_choice_label,
+                validate=lambda info: (
+                    None
+                    if run_has_visuals(info["path"])
+                    else "That run has no saved or rebuildable visualizations."
+                ),
             )
             fps = ask_text("FPS (frames per second):", 6.0, float)
             scene = ask_text(
@@ -1021,12 +1095,45 @@ def wizard():
                 choices = [Choice("None - start fresh", value={})]
                 for r in runs:
                     choices.append(Choice(resume_label(r), value=r["resolved"]))
+                choices.append(
+                    Choice("📁 Enter a run path manually…", value=_MANUAL_RUN)
+                )
 
                 selected_copy = ask_select_with_back(
                     "Copy settings from previous run?",
                     choices,
                     default=choices[0]
                 )
+                if selected_copy is _MANUAL_RUN:
+                    selected_copy = {}
+                    while True:
+                        raw = ask_text(
+                            "Run path to copy settings from "
+                            "(absolute, ~, or relative to RUNS/; blank = start fresh):",
+                            None,
+                            str,
+                            optional=True,
+                        )
+                        if raw is None:
+                            break
+                        run_dir = _resolve_run_path(raw)
+                        if run_dir is None:
+                            console.print(f"[red]No such directory:[/] {raw}")
+                            continue
+                        resolved = build_resume_info(run_dir)["resolved"]
+                        if not resolved:
+                            console.print(
+                                f"[red]{run_dir} has no config.resolved.json to copy.[/]"
+                            )
+                            continue
+                        other = resolved.get("controller")
+                        if other and other != controller:
+                            console.print(
+                                f"[yellow]Note: that run's controller is {other!r}, "
+                                f"not {controller!r}; copying its settings anyway.[/]"
+                            )
+                        selected_copy = resolved
+                        break
                 copied_cfg.update(selected_copy)
 
                 if copied_cfg:
