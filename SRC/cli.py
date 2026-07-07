@@ -883,6 +883,28 @@ def wizard():
                 run_choice_label,
                 requires=("sim_traj.tum", "gt_traj.tum"),
             )
+
+            # If the run has multiple takes, offer to plot just one of them.
+            take = None
+            windows = runner_plot.read_take_windows(selected["path"])
+            if len(windows) > 1:
+                take_choices = [
+                    Choice("All takes (combined trajectory)", value=None)
+                ]
+                for w in windows:
+                    take_choices.append(
+                        Choice(
+                            f"Take {w['take']} — tasks {w['task_start']}–{w['task_end']} "
+                            f"({w['n_tasks']} tasks)",
+                            value=w["take"],
+                        )
+                    )
+                take = ask_select_with_back(
+                    f"This run has {len(windows)} takes — plot which?",
+                    take_choices,
+                    default=take_choices[0],
+                )
+
             rpe_delta = ask_text("RPE delta (frames):", 1, int)
             out = ask_text(
                 "Output dir (blank = <run>/evo_plots):", None, str, optional=True
@@ -896,6 +918,8 @@ def wizard():
             run=str(selected["path"]),
             rpe_delta=int(rpe_delta),
             out=out,
+            take=take,
+            list_takes=False,
         )
         runner_plot.run(runner_args)
         return 0

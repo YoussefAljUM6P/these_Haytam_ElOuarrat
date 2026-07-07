@@ -38,6 +38,21 @@ def add_arguments(parser):
         default=None,
         help="Output directory for plots (default <run>/evo_plots).",
     )
+    parser.add_argument(
+        "--take",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Plot only take N (1-based) of a multi-take run instead of the "
+            "whole combined trajectory. Default: all takes together."
+        ),
+    )
+    parser.add_argument(
+        "--list-takes",
+        action="store_true",
+        help="List the takes detected in the run and exit (no plotting).",
+    )
 
 
 def resolve_run_dir(run_arg):
@@ -52,8 +67,71 @@ def resolve_run_dir(run_arg):
     return candidate.resolve()
 
 
-def detailed_evo_plots(sim_tum, gt_tum, out_dir, rpe_delta, label):
+def read_take_windows(run_dir):
+    """Detect the takes of a finished trajectory run from per_task_errors.csv.
+
+    A take is a smooth capture pass; the runner marks the first task of each
+    take with ``sequence_reset=1``. Every task appends exactly one pose to
+    sim/gt_traj.tum at timestamp ``task_index + 1`` (pose 0 is the initial
+    camera at timestamp 0), so each take maps to a contiguous timestamp window.
+
+    Returns a list of dicts ``{take, task_start, task_end, t_lo, t_hi,
+    n_tasks}`` (1-based ``take``), or ``[]`` when there is no CSV / no rows.
+    A single-take run yields one entry spanning the whole trajectory.
+    """
+    import csv
+
+    csv_path = Path(run_dir) / "per_task_errors.csv"
+    if not csv_path.is_file():
+        return []
+    with open(csv_path) as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return []
+
+    def _is_reset(row):
+        return str(row.get("sequence_reset", "0")).strip() not in ("", "0", "False", "false")
+
+    starts = [int(r["task_index"]) for r in rows if _is_reset(r)]
+    first_task = int(rows[0]["task_index"])
+    if not starts or starts[0] != first_task:
+        starts = [first_task] + starts  # take 1 always begins at the first task
+    last_task = int(rows[-1]["task_index"])
+
+    windows = []
+    for k, start in enumerate(starts):
+        nxt = starts[k + 1] if k + 1 < len(starts) else last_task + 1
+        windows.append(
+            {
+                "take": k + 1,
+                "task_start": start,
+                "task_end": nxt - 1,
+                "t_lo": float(start + 1),   # pose timestamp of the take's first task
+                "t_hi": float(nxt),          # pose timestamp of the take's last task
+                "n_tasks": nxt - start,
+            }
+        )
+    return windows
+
+
+def _filter_by_window(ts, poses, window):
+    """Keep only (timestamp, pose) pairs whose timestamp is inside window."""
+    if window is None:
+        return ts, poses
+    t_lo, t_hi = window
+    kept = [(t, p) for t, p in zip(ts, poses) if t_lo <= t <= t_hi]
+    if not kept:
+        return [], []
+    ks, kp = zip(*kept)
+    return list(ks), list(kp)
+
+
+def detailed_evo_plots(sim_tum, gt_tum, out_dir, rpe_delta, label, take_window=None):
     """Read two TUM files and write the detailed evo APE/RPE plot set.
+
+    ``take_window`` optionally restricts evaluation to a ``(t_lo, t_hi)``
+    timestamp range (inclusive) so a single take can be plotted in isolation;
+    pass None to use the whole trajectory.
 
     Returns the metrics dict (same shape the trajectory runner records).
     """
@@ -70,6 +148,15 @@ def detailed_evo_plots(sim_tum, gt_tum, out_dir, rpe_delta, label):
 
     sim_ts, sim_poses = read_tum(sim_tum)
     gt_ts, gt_poses = read_tum(gt_tum)
+
+    sim_ts, sim_poses = _filter_by_window(sim_ts, sim_poses, take_window)
+    gt_ts, gt_poses = _filter_by_window(gt_ts, gt_poses, take_window)
+    if len(sim_ts) < 2 or len(gt_ts) < 2:
+        raise ValueError(
+            "not enough poses to evaluate"
+            + (f" for take window {take_window}" if take_window else "")
+            + f" (sim={len(sim_ts)}, gt={len(gt_ts)})"
+        )
 
     traj_sim = poses_to_evo_trajectory(sim_ts, sim_poses)
     traj_gt = poses_to_evo_trajectory(gt_ts, gt_poses)
@@ -163,10 +250,40 @@ def run(args):
         if not path.is_file():
             raise FileNotFoundError(f"missing trajectory file: {path}")
 
+    windows = read_take_windows(run_dir)
+
+    if getattr(args, "list_takes", False):
+        if len(windows) <= 1:
+            print(f"{run_dir.name}: single take (no take split).")
+        else:
+            print(f"{run_dir.name}: {len(windows)} takes")
+            for w in windows:
+                print(
+                    f"  take {w['take']}: tasks {w['task_start']}-{w['task_end']} "
+                    f"({w['n_tasks']} tasks)"
+                )
+        return
+
+    take = getattr(args, "take", None)
+    take_window = None
     out_dir = Path(args.out) if args.out else run_dir / "evo_plots"
     label = run_dir.name
+    if take is not None:
+        match = next((w for w in windows if w["take"] == take), None)
+        if match is None:
+            n = len(windows)
+            raise ValueError(
+                f"take {take} not found in {run_dir.name}; this run has "
+                f"{n} take{'s' if n != 1 else ''} (valid: 1..{n})."
+            )
+        take_window = (match["t_lo"], match["t_hi"])
+        label = f"{run_dir.name} (take {take}/{len(windows)})"
+        if args.out is None:
+            out_dir = run_dir / "evo_plots" / f"take_{take}"
 
-    metrics = detailed_evo_plots(sim_tum, gt_tum, out_dir, args.rpe_delta, label)
+    metrics = detailed_evo_plots(
+        sim_tum, gt_tum, out_dir, args.rpe_delta, label, take_window=take_window
+    )
 
     try:
         rel = out_dir.relative_to(PROJECT_ROOT)
