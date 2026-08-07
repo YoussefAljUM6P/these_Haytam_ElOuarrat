@@ -39,16 +39,6 @@ def add_arguments(parser):
         help="Output directory for plots (default <run>/evo_plots).",
     )
     parser.add_argument(
-        "--take",
-        type=int,
-        default=None,
-        metavar="N",
-        help=(
-            "Plot only take N (1-based) of a multi-take run instead of the "
-            "whole combined trajectory. Default: all takes together."
-        ),
-    )
-    parser.add_argument(
         "--list-takes",
         action="store_true",
         help="List the takes detected in the run and exit (no plotting).",
@@ -114,6 +104,32 @@ def read_take_windows(run_dir):
     return windows
 
 
+def read_diverged_timestamps(run_dir):
+    """Pose timestamps of tasks flagged diverged in ``per_task_errors.csv``.
+
+    Each task appends one pose at timestamp ``task_index + 1`` (pose 0 is the
+    initial camera at timestamp 0), so a diverged task at ``task_index`` maps to
+    pose timestamp ``task_index + 1``. Returns a set of such timestamps (empty
+    when there is no CSV or nothing diverged).
+    """
+    import csv
+
+    csv_path = Path(run_dir) / "per_task_errors.csv"
+    if not csv_path.is_file():
+        return set()
+    diverged = set()
+    with open(csv_path) as f:
+        for row in csv.DictReader(f):
+            flag = str(row.get("diverged", "0")).strip()
+            if flag in ("", "0", "False", "false"):
+                continue
+            try:
+                diverged.add(int(row["task_index"]) + 1)
+            except (KeyError, ValueError):
+                continue
+    return diverged
+
+
 def _filter_by_window(ts, poses, window):
     """Keep only (timestamp, pose) pairs whose timestamp is inside window."""
     if window is None:
@@ -126,18 +142,25 @@ def _filter_by_window(ts, poses, window):
     return list(ks), list(kp)
 
 
-def detailed_evo_plots(sim_tum, gt_tum, out_dir, rpe_delta, label, take_window=None):
+def detailed_evo_plots(sim_tum, gt_tum, out_dir, rpe_delta, label,
+                       take_window=None, diverged_ts=None):
     """Read two TUM files and write the detailed evo APE/RPE plot set.
 
     ``take_window`` optionally restricts evaluation to a ``(t_lo, t_hi)``
     timestamp range (inclusive) so a single take can be plotted in isolation;
     pass None to use the whole trajectory.
 
+    ``diverged_ts`` is an optional set of pose timestamps (``task_index + 1``,
+    see :func:`read_diverged_timestamps`) whose tasks were flagged diverged; a
+    red ``X`` is drawn at each such pose on the trajectory overlays and on the
+    APE curves. Timestamps outside the current take window are ignored.
+
     Returns the metrics dict (same shape the trajectory runner records).
     """
     import json
 
     import matplotlib
+    import numpy as np
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -162,6 +185,31 @@ def detailed_evo_plots(sim_tum, gt_tum, out_dir, rpe_delta, label, take_window=N
     traj_gt = poses_to_evo_trajectory(gt_ts, gt_poses)
     traj_gt, traj_sim = sync.associate_trajectories(traj_gt, traj_sim, max_diff=1e-3)
     pair = (traj_gt, traj_sim)
+
+    # --- diverged-task markers ---------------------------------------------
+    # Map the diverged pose timestamps to (index, xyz) on the synced sim
+    # trajectory so we can drop a red X at each on the plots below.
+    div_idx = np.array([], dtype=int)
+    div_xyz = np.empty((0, 3))
+    if diverged_ts:
+        want = np.array(sorted(int(t) for t in diverged_ts), dtype=int)
+        sim_ts_int = np.rint(np.asarray(traj_sim.timestamps)).astype(int)
+        mask = np.isin(sim_ts_int, want)
+        div_idx = np.nonzero(mask)[0]
+        div_xyz = traj_sim.positions_xyz[mask]
+
+    def _mark_traj(ax, mode):
+        """Scatter a red X at each diverged pose on a trajectory axis."""
+        if len(div_xyz) == 0:
+            return
+        if mode == plot.PlotMode.xyz:
+            ax.scatter(div_xyz[:, 0], div_xyz[:, 1], div_xyz[:, 2],
+                       marker="x", color="red", s=90, linewidths=2,
+                       zorder=5, label="diverged")
+        else:  # xy
+            ax.scatter(div_xyz[:, 0], div_xyz[:, 1],
+                       marker="x", color="red", s=90, linewidths=2,
+                       zorder=5, label="diverged")
 
     ape_t = evo_metrics.APE(PoseRelation.translation_part)
     ape_t.process_data(pair)
@@ -192,6 +240,7 @@ def detailed_evo_plots(sim_tum, gt_tum, out_dir, rpe_delta, label, take_window=N
         ax = plot.prepare_axis(fig, mode)
         plot.traj(ax, mode, traj_gt, style="-", color="green", label="GT")
         plot.traj(ax, mode, traj_sim, style="--", color="red", label="sim")
+        _mark_traj(ax, mode)
         ax.legend()
         ax.set_title(f"{label}: {title}")
         fig.savefig(out_dir / f"{suffix}.png", dpi=130, bbox_inches="tight")
@@ -205,6 +254,9 @@ def detailed_evo_plots(sim_tum, gt_tum, out_dir, rpe_delta, label, take_window=N
         ax, traj_sim, ape_t.error, plot.PlotMode.xy,
         min_map=float(ape_t.error.min()), max_map=float(ape_t.error.max()),
     )
+    _mark_traj(ax, plot.PlotMode.xy)
+    if len(div_xyz):
+        ax.legend()
     ax.set_title(f"{label}: trajectory colored by APE translation")
     fig.savefig(out_dir / "trajectory_ape_colormap.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
@@ -227,6 +279,14 @@ def detailed_evo_plots(sim_tum, gt_tum, out_dir, rpe_delta, label, take_window=N
             },
             name=title, title=f"{label}: {title}", xlabel="task index",
         )
+        # APE curves are indexed per synced pose, so the diverged pose indices
+        # line up directly; RPE curves are shorter (per delta), so skip them.
+        if suffix.startswith("ape_") and len(div_idx):
+            keep = div_idx[div_idx < len(metric.error)]
+            if len(keep):
+                ax.scatter(keep, metric.error[keep], marker="x", color="red",
+                           s=90, linewidths=2, zorder=5, label="diverged")
+                ax.legend()
         fig.savefig(out_dir / f"{suffix}.png", dpi=130, bbox_inches="tight")
         plt.close(fig)
 
@@ -264,25 +324,15 @@ def run(args):
                 )
         return
 
-    take = getattr(args, "take", None)
-    take_window = None
     out_dir = Path(args.out) if args.out else run_dir / "evo_plots"
     label = run_dir.name
-    if take is not None:
-        match = next((w for w in windows if w["take"] == take), None)
-        if match is None:
-            n = len(windows)
-            raise ValueError(
-                f"take {take} not found in {run_dir.name}; this run has "
-                f"{n} take{'s' if n != 1 else ''} (valid: 1..{n})."
-            )
-        take_window = (match["t_lo"], match["t_hi"])
-        label = f"{run_dir.name} (take {take}/{len(windows)})"
-        if args.out is None:
-            out_dir = run_dir / "evo_plots" / f"take_{take}"
+    diverged_ts = read_diverged_timestamps(run_dir)
+    if diverged_ts:
+        print(f"{label}: {len(diverged_ts)} diverged task(s) marked with a red X")
 
     metrics = detailed_evo_plots(
-        sim_tum, gt_tum, out_dir, args.rpe_delta, label, take_window=take_window
+        sim_tum, gt_tum, out_dir, args.rpe_delta, label, take_window=None,
+        diverged_ts=diverged_ts,
     )
 
     try:
@@ -300,3 +350,20 @@ def run(args):
             f"std={stats.get('std', float('nan')):.6f}"
         )
     print(f"\nwrote detailed plots -> {rel}")
+
+    if len(windows) > 1:
+        print(f"\n--- Saving {len(windows)} independent takes ---")
+        for w in windows:
+            take = w["take"]
+            t_label = f"{label} (take {take}/{len(windows)})"
+            t_out_dir = out_dir / f"take_{take}"
+            t_window = (w["t_lo"], w["t_hi"])
+            t_metrics = detailed_evo_plots(
+                sim_tum, gt_tum, t_out_dir, args.rpe_delta, t_label,
+                take_window=t_window, diverged_ts=diverged_ts,
+            )
+            try:
+                t_rel = t_out_dir.relative_to(PROJECT_ROOT)
+            except ValueError:
+                t_rel = t_out_dir
+            print(f"Take {take} ({t_metrics['num_poses']} poses) -> {t_rel}")

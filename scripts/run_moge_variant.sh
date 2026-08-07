@@ -27,11 +27,12 @@ set -euo pipefail
 export QT_QPA_PLATFORM=offscreen
 
 # ─── Config (must match run_pipeline.sh) ─────────────────────────────────────
-REPO_ROOT="/home/haytam.elouarrat/lustre/med_img-z2y8h4a967e/code_Haytam"
-GS_DIR="$REPO_ROOT/gaussian-splatting"
-SERVIS_DIR="$REPO_ROOT/SERVIS"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVIS_DIR="${SERVIS_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+REPO_ROOT="${SERVIS_WORKSPACE_ROOT:-$(dirname "$SERVIS_DIR")}"
+GS_DIR="${GS_DIR:-$REPO_ROOT/gaussian-splatting}"
 MOGE_SCRIPT="$SERVIS_DIR/SRC/make_moge_depths.py"
-COLLECTOR="$REPO_ROOT/gs_benchmark/collect_metrics.py"
+COLLECTOR="${COLLECTOR:-$REPO_ROOT/gs_benchmark/collect_metrics.py}"
 SERVIS_ENV="servis"                 # has MoGe-2 installed
 GS_ENV="gaussian_splatting"         # baseline training env
 CUDA_MODULE="CUDA/12.1.1"
@@ -41,8 +42,12 @@ ITERS=30000
 DENSIFY_UNTIL=20000
 GRAD_THRESHOLD=0.00015
 COLOR_GLOB="*.color.jpg"            # only feed colour frames to MoGe
-NTFY="ntfy.sh/HPC"
+NTFY="${SERVIS_NTFY_TOPIC:-}"
 # ─────────────────────────────────────────────────────────────────────────────
+
+notify() {
+    [ -z "$NTFY" ] || curl -fsS -d "$1" "$NTFY" >/dev/null || true
+}
 
 DATASETS_ROOT="${1:?Usage: bash run_moge_variant.sh <datasets_root> [scene_name]}"
 DATASETS_ROOT="$(realpath "${DATASETS_ROOT%/}")"
@@ -55,7 +60,7 @@ conda_off() { set +u; conda deactivate; set -u; }
 module load "$CUDA_MODULE" 2>/dev/null || true
 [ -f "$CSV" ] || echo "scene,PSNR,LPIPS,SSIM" > "$CSV"
 
-trap 'curl -d "❌ moge variant FAILED at: ${SCENE:-unknown}" '"$NTFY"' || true' ERR
+trap 'notify "❌ moge variant FAILED at: ${SCENE:-unknown}"' ERR
 FAILED=()
 
 for SCENE_DIR in "$DATASETS_ROOT"/*/; do
@@ -79,7 +84,7 @@ for SCENE_DIR in "$DATASETS_ROOT"/*/; do
 
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "🗂️  $SCENE  (MoGe variant)"
-    curl -d "🚀 moge start: $SCENE" "$NTFY" || true
+    notify "🚀 moge start: $SCENE"
 
     if [ -f "$OUT_MOGE/point_cloud/iteration_$ITERS/point_cloud.ply" ]; then
         echo "    ⏭️  output_moge already trained (iter $ITERS)"
@@ -146,7 +151,7 @@ for SCENE_DIR in "$DATASETS_ROOT"/*/; do
         --results "$OUT_MOGE/results.json" --csv "$CSV"
     conda_off
 
-    curl -d "✅ moge done: $SCENE" "$NTFY" || true
+    notify "✅ moge done: $SCENE"
     echo "    ✅ $SCENE MoGe variant complete"
 done
 

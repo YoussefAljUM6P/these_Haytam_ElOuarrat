@@ -1,0 +1,13 @@
+{
+  "kind": "servo_frames",
+  "scene_dir": "example_scene",
+  "renderer": "mesh",
+  "controller": "ibvs",
+  "depth_mode": "intrinsic",
+  "feature_method": "sift",
+  "start_index": 1,
+  "target_index": null,
+  "index_away": 1,
+  "iterations": 100,
+  "viz_iter": 5
+}

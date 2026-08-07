@@ -1,6 +1,6 @@
 """Detect and persist capture "takes" for a scene.
 
-A Mip-360-style dataset is one flat list of frames, but the capture is often
+Some datasets are one flat list of frames, but the capture is often
 several passes ("takes"): the camera moves smoothly, then teleports to start a
 new pass. There is no metadata for this — the only signal is a large jump in
 camera position between consecutive frames.
@@ -17,6 +17,7 @@ Use via the CLI:
 """
 
 import json
+import re
 from pathlib import Path
 
 from run_layout import color
@@ -36,6 +37,33 @@ DEFAULT_JUMP_FACTOR = 5.0
 
 TAKES_FILENAME = "takes.json"
 TAKES_VERSION = 1
+
+# Some datasets (Stanford/SUN3D "gates*" StructureSensor captures) ship the
+# authoritative take boundaries in a split.txt alongside the frames, one line
+# per pass, e.g. "sequence0 [frames=1053]  [start=0 ; end=1052]". When present
+# this is preferred over jump detection: it needs no threshold and stays correct
+# even when the COLMAP model only registered some of the sequences.
+SPLIT_FILENAME = "split.txt"
+_SPLIT_RANGE_RE = re.compile(r"start\s*=\s*(\d+)\s*;\s*end\s*=\s*(\d+)")
+
+
+def parse_split(scene_dir):
+    """Parse a dataset ``split.txt`` into inclusive ``(start, end)`` frame ranges.
+
+    Returns the ranges in file order, or ``None`` when the file is absent or has
+    no parseable ``start=.. ; end=..`` lines. Ranges are by frame *number* (the
+    integer in ``frame-NNNNNN``), matching how the captures are numbered on disk.
+    """
+    path = Path(scene_dir) / SPLIT_FILENAME
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    ranges = [(int(m.group(1)), int(m.group(2)))
+              for m in _SPLIT_RANGE_RE.finditer(text)]
+    return ranges or None
 
 
 def takes_path(scene_dir):
@@ -107,6 +135,104 @@ def detect_takes(frame_ids, centers, jump_factor=DEFAULT_JUMP_FACTOR, scene=None
         "num_takes": len(takes),
         "takes": takes,
     }
+
+
+def detect_takes_from_split(frame_ids, centers, ranges, scene=None):
+    """Segment frames using dataset-provided ``split.txt`` ranges.
+
+    Each frame is assigned to the range whose inclusive ``[start, end]`` (by
+    frame number) contains it. Only frames present in ``frame_ids`` are emitted,
+    so a scene whose COLMAP model registered just some sequences yields exactly
+    the takes it has frames for (the rest simply have no frames yet). Ranges with
+    no present frame are skipped and takes are re-indexed contiguously.
+
+    ``frame_ids`` must be in capture order with ``centers[i]`` the world-space
+    center of ``frame_ids[i]``. Returns the same JSON document shape as
+    :func:`detect_takes`.
+    """
+    import numpy as np
+
+    centers = np.asarray(centers, dtype=np.float64)
+    n = len(frame_ids)
+    if n == 0:
+        raise ValueError("detect_takes_from_split: no frames")
+
+    def range_of(num):
+        for r, (start, end) in enumerate(ranges):
+            if start <= num <= end:
+                return r
+        return None
+
+    assigned = [range_of(frame_number(f)) for f in frame_ids]
+    dropped = sum(1 for a in assigned if a is None)
+
+    steps = (np.linalg.norm(np.diff(centers, axis=0), axis=1)
+             if n > 1 else np.zeros(0, dtype=np.float64))
+    median_step = float(np.median(steps)) if steps.size else 0.0
+
+    # Collect the frame indices belonging to each range, in order.
+    grouped = []  # (range_idx, [frame index into frame_ids, ...])
+    for r in range(len(ranges)):
+        idxs = [i for i, a in enumerate(assigned) if a == r]
+        if idxs:
+            grouped.append((r, idxs))
+
+    takes = []
+    for k, (r, idxs) in enumerate(grouped):
+        seg = [frame_ids[i] for i in idxs]
+        internal = np.array(
+            [float(np.linalg.norm(centers[idxs[j + 1]] - centers[idxs[j]]))
+             for j in range(len(idxs) - 1)],
+            dtype=np.float64,
+        ) if len(idxs) > 1 else np.zeros(0)
+        # Distance from this take's last present frame to the next take's first.
+        boundary_step = None
+        if k + 1 < len(grouped):
+            next_idxs = grouped[k + 1][1]
+            boundary_step = float(
+                np.linalg.norm(centers[next_idxs[0]] - centers[idxs[-1]])
+            )
+        takes.append({
+            "index": k,
+            "start_frame": seg[0],
+            "end_frame": seg[-1],
+            "count": len(seg),
+            "max_internal_step": float(internal.max()) if internal.size else 0.0,
+            "boundary_step": boundary_step,
+            "split_range": list(ranges[r]),
+            "frames": seg,
+        })
+
+    return {
+        "version": TAKES_VERSION,
+        "scene": scene,
+        "source": "split",
+        "num_frames": n,
+        "num_ranges": len(ranges),
+        "dropped_frames": dropped,
+        "jump_factor": None,
+        "median_step": median_step,
+        "threshold": None,
+        "num_takes": len(takes),
+        "takes": takes,
+    }
+
+
+def build_takes_document(scene_dir, frame_ids, centers,
+                         jump_factor=DEFAULT_JUMP_FACTOR):
+    """Detect takes for ``scene_dir``, preferring ``split.txt`` over jumps.
+
+    Uses the dataset's authoritative ``split.txt`` boundaries when present,
+    otherwise falls back to camera-center jump detection.
+    """
+    ranges = parse_split(scene_dir)
+    if ranges:
+        return detect_takes_from_split(
+            frame_ids, centers, ranges, scene=Path(scene_dir).name
+        )
+    return detect_takes(
+        frame_ids, centers, jump_factor=jump_factor, scene=Path(scene_dir).name
+    )
 
 
 def validate_takes(data, frame_ids):
@@ -193,8 +319,8 @@ def ensure_takes(scene_dir, frame_index, jump_factor=DEFAULT_JUMP_FACTOR,
     centers = _camera_centers(
         frame_ids, lambda fid: frame_index[fid]["camera"]
     )
-    data = detect_takes(
-        frame_ids, centers, jump_factor=jump_factor, scene=scene_dir.name
+    data = build_takes_document(
+        scene_dir, frame_ids, centers, jump_factor=jump_factor
     )
     save_takes(scene_dir, data)
     thr = data["threshold"]
@@ -227,18 +353,26 @@ def compute_takes_for_scene(scene_dir, jump_factor=DEFAULT_JUMP_FACTOR):
 
     frame_ids = sorted(camera_by_id, key=frame_number)
     centers = _camera_centers(frame_ids, lambda fid: camera_by_id[fid])
-    return detect_takes(
-        frame_ids, centers, jump_factor=jump_factor, scene=scene_dir.name
+    return build_takes_document(
+        scene_dir, frame_ids, centers, jump_factor=jump_factor
     )
 
 
 def print_takes_summary(data):
     thr = data["threshold"]
+    source = data.get("source", "colmap")
+    if source == "split":
+        dropped = data.get("dropped_frames", 0)
+        detail = f"source=split.txt ({data.get('num_ranges', '?')} ranges"
+        detail += f", {dropped} frames outside any range)" if dropped else ")"
+    else:
+        detail = (
+            f"median step={data['median_step']:.4f}, "
+            f"threshold={'inf' if thr is None else f'{thr:.4f}'}"
+        )
     print(
         f"  {data.get('scene', '?')}: {data['num_takes']} take(s), "
-        f"{data['num_frames']} frames "
-        f"(median step={data['median_step']:.4f}, "
-        f"threshold={'inf' if thr is None else f'{thr:.4f}'})"
+        f"{data['num_frames']} frames ({detail})"
     )
     for take in data["takes"]:
         boundary = take["boundary_step"]

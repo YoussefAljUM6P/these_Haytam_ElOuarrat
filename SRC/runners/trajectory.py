@@ -788,6 +788,7 @@ def resolved_trajectory_config(tag, run_root):
         "max_pairs": MAX_PAIRS,
         "use_takes": bool(USE_TAKES),
         "takes_jump_factor": float(TAKES_JUMP_FACTOR),
+        "take_indices": (None if TAKE_INDICES is None else list(TAKE_INDICES)),
         "stop_residual_px": float(STOP_RESIDUAL_PX),
         "stop_mse_per_px": float(STOP_MSE_PER_PX),
         "stop_ssd": None if STOP_SSD is None else float(STOP_SSD),
@@ -899,11 +900,28 @@ def run_scene(scene_name, run_root, resume=False):
     frame_ids = sorted_frame_ids(frame_index)
 
     takes = None
-    if USE_TAKES:
+    if USE_TAKES or TAKE_INDICES:
         from takes import ensure_takes
-        takes = ensure_takes(
+        all_takes = ensure_takes(
             scene_dir, frame_index, jump_factor=TAKES_JUMP_FACTOR
         )
+        if TAKE_INDICES:
+            selected = []
+            for i in TAKE_INDICES:
+                if not 1 <= int(i) <= len(all_takes):
+                    raise RuntimeError(
+                        f"{scene_name}: take_indices entry {i} out of range "
+                        f"1..{len(all_takes)}"
+                    )
+                selected.append(all_takes[int(i) - 1])
+            print(color(
+                f"[takes] running {len(selected)}/{len(all_takes)} selected "
+                f"take(s): {list(TAKE_INDICES)}",
+                "cyan",
+            ))
+            takes = selected
+        else:
+            takes = all_takes
 
     tasks = build_trajectory_tasks(frame_ids, takes)
     if not tasks:
@@ -1286,6 +1304,38 @@ def run_scene(scene_name, run_root, resume=False):
         last_info = last_history.get("controller_info", {})
         fault_reason = last_info.get("fault_reason")
 
+        # A raw Python exception inside the render/controller step (fault_reason
+        # ends in "_exception") is a code/system fault, not a servoing
+        # divergence. It is identical on every task, so cutting-to-desired and
+        # continuing just produces a meaningless ground-truth-stitched
+        # trajectory. Abort the whole run and surface the traceback, regardless
+        # of CONTINUE_ON_TASK_FAILURE (which is meant for genuine divergence /
+        # no-features, not for bugs or OOM).
+        if isinstance(fault_reason, str) and fault_reason.endswith("_exception"):
+            fault_detail = last_info.get("fault_detail", "")
+            fault_tb = last_info.get("traceback", "")
+            task_row["failure_type"] = fault_reason
+            task_row["failure_message"] = fault_detail
+            task_row["stop_reason"] = f"abort_{fault_reason}"
+            append_task_row(csv_path, task_row)
+            if fault_tb:
+                sys.stderr.write("\n" + fault_tb + "\n")
+                sys.stderr.flush()
+            oom_hint = ""
+            if _is_cuda_out_of_memory(RuntimeError(fault_detail)):
+                oom_hint = (
+                    " CUDA out of memory: the renderer and the learned-depth "
+                    "model do not fit on this GPU together. Use depth_mode="
+                    "'intrinsic', a smaller render scale, or a bigger GPU."
+                )
+            print(
+                f"[{scene_name}] ABORT at task {task_idx:04d}: {fault_reason} "
+                f"({fault_detail}).{oom_hint} This is a code/system fault, not a "
+                f"divergence; stopping the run instead of cutting through "
+                f"remaining tasks."
+            )
+            raise SystemExit(1)
+
         # A controller fault (e.g. no usable pixels/features found because the
         # camera renders empty geometry) or a non-finite residual is a failure,
         # not convergence. NaN slips past `final_resid > threshold`, so flag it
@@ -1486,6 +1536,7 @@ def run_scene(scene_name, run_root, resume=False):
         "save_task_viz": bool(SAVE_TASK_VIZ),
         "task_viz_every": int(TASK_VIZ_EVERY),
         "use_takes": bool(USE_TAKES),
+        "take_indices": (None if TAKE_INDICES is None else list(TAKE_INDICES)),
         "num_takes": int(num_takes),
         "num_tasks": len(per_task_rows),
         "num_cuts": num_corrected,
@@ -1501,6 +1552,37 @@ def run_scene(scene_name, run_root, resume=False):
     with open(scene_out / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
     return summary
+
+
+def auto_standardize_metric(run_root):
+    """Convert a finished run's errors to metric units (12-Scenes scenes only).
+
+    Runs the metric standardizer on the just-written run. It self-skips non-metric
+    scenes, and any failure here is swallowed so it can never break an
+    otherwise-completed trajectory run. Writes <run>/metric_standardized/.
+    """
+    try:
+        import importlib.util
+
+        spec_path = PROJECT_ROOT / "SRC" / "scripts" / "standardize_metric.py"
+        spec = importlib.util.spec_from_file_location("standardize_metric", spec_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        result = mod.standardize_run(run_root, unit="mm", max_fit_pct=3.0)
+    except Exception as e:  # never let standardization break a completed run
+        print(f"[warn] metric standardization skipped: {e}")
+        return
+
+    status = result.get("status")
+    if status in ("ok", "warn"):
+        evo_txt = Path(run_root) / "metric_standardized" / "evo_metrics.txt"
+        note = "" if status == "ok" else "  [LOW CONFIDENCE - scale unreliable]"
+        print(
+            f"Metric-standardized ({result['scene']}): "
+            f"scale={result['scale_m_per_colmap_unit']:.6f} m/unit, "
+            f"fit {result['fit_pct']:.1f}%  ->  {evo_txt}{note}"
+        )
+    # status == "skip" (non-Stanford scene) is silent by design.
 
 
 def run(args):
@@ -1632,3 +1714,4 @@ def run(args):
         )
         print(f"\nWrote {run_root}")
         print(f"Summary table: {run_root / 'summary.md'}")
+        auto_standardize_metric(run_root)

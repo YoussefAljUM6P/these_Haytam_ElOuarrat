@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from run_layout import write_json
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 RUNS_ROOT = PROJECT_ROOT / "RUNS"
@@ -161,6 +163,18 @@ def add_arguments(parser):
         help="Override minimum IBVS feature count for every condition.",
     )
     parser.add_argument(
+        "--diverge-translation-error",
+        type=float,
+        default=None,
+        help="Override final translation-error divergence threshold for every condition.",
+    )
+    parser.add_argument(
+        "--diverge-rotation-error-deg",
+        type=float,
+        default=None,
+        help="Override final rotation-error divergence threshold for every condition.",
+    )
+    parser.add_argument(
         "--save-task-viz",
         action="store_true",
         help="Keep per-task final-vs-target images. Disabled by default.",
@@ -218,6 +232,8 @@ def condition_overrides(condition, args, batch_id):
         "gain": args.gain,
         "ratio": args.ratio,
         "min_features": args.min_features,
+        "diverge_translation_error": args.diverge_translation_error,
+        "diverge_rotation_error_deg": args.diverge_rotation_error_deg,
     }
     for key, value in optional.items():
         if value is not None:
@@ -262,13 +278,6 @@ def scene_asset_error(condition, dataset):
 
 def has_colmap_reconstruction(dataset):
     return (PROJECT_ROOT / "DATA" / dataset / "sparse" / "0").exists()
-
-
-def write_json(path, data):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
 
 
 def run_condition(condition, args, batch_id, batch_dir):
@@ -419,9 +428,11 @@ def load_condition_metrics(condition_dir, run_root, dataset):
     if not isinstance(ape_translation, dict):
         return {}, "ape_translation metrics not found"
 
+    timing = scene_summary.get("timing", {})
     return {
         "translation": ape_translation,
         "rotation": ape_rotation if isinstance(ape_rotation, dict) else {},
+        "timing": timing if isinstance(timing, dict) else {},
     }, None
 
 
@@ -493,6 +504,15 @@ def write_condition_metrics_txt(path, condition, metrics, error):
                 f"{METRIC_LABELS[key]}: "
                 f"{format_metric(metric_value(metrics, 'rotation', key))}"
             )
+        lines.append("")
+        lines.append("Timing")
+        lines.append(
+            f"Average FPS: {format_metric(metric_value(metrics, 'timing', 'fps'))}"
+        )
+        lines.append(
+            "Average render ms: "
+            f"{format_metric(metric_value(metrics, 'timing', 'render_ms_mean'))}"
+        )
     Path(path).write_text("\n".join(lines).rstrip() + "\n")
 
 
@@ -510,6 +530,7 @@ def write_batch_outputs(batch_dir, results):
                 "returncode": r["returncode"],
                 "error": r["error"],
                 "skipped": r["skipped"],
+                "timing": r["metrics"].get("timing", {}),
             }
             for r in results
         ],
@@ -553,6 +574,8 @@ def write_long_csv(path, results):
         "ape_rotation_median_deg",
         "ape_rotation_std_deg",
         "ape_rotation_max_deg",
+        "avg_fps",
+        "avg_render_ms",
         "run_root",
         "condition_dir",
         "error",
@@ -581,6 +604,14 @@ def write_long_csv(path, results):
                 row[f"ape_rotation_{key}_deg"] = (
                     "" if r_value is None else f"{r_value:.6f}"
                 )
+            fps = None if error else metric_value(metrics, "timing", "fps")
+            render_ms = (
+                None if error else metric_value(metrics, "timing", "render_ms_mean")
+            )
+            row["avg_fps"] = "" if fps is None else f"{fps:.6f}"
+            row["avg_render_ms"] = (
+                "" if render_ms is None else f"{render_ms:.6f}"
+            )
             writer.writerow(row)
 
 
@@ -655,7 +686,9 @@ def run(args):
             print(
                 "  ok: "
                 f"trans_rmse={format_metric(metric_value(metrics, 'translation', 'rmse'))} "
-                f"rot_rmse={format_metric(metric_value(metrics, 'rotation', 'rmse'))}deg"
+                f"rot_rmse={format_metric(metric_value(metrics, 'rotation', 'rmse'))}deg "
+                f"avg_fps={format_metric(metric_value(metrics, 'timing', 'fps'))} "
+                f"avg_render_ms={format_metric(metric_value(metrics, 'timing', 'render_ms_mean'))}"
             )
         else:
             status = "skipped" if result["skipped"] else "failed"

@@ -153,13 +153,26 @@ def collect_glob_frames(run_dir, scene=None, pattern="visualizations/*.png"):
 
 
 def collect_frames(run_dir, scene=None, pattern="visualizations/*.png"):
-    frames = collect_manifest_frames(run_dir, scene=scene)
-    if frames:
-        return frames
+    manifest_frames = collect_manifest_frames(run_dir, scene=scene)
 
-    frames = collect_glob_frames(run_dir, scene=scene, pattern=pattern)
-    if frames:
-        return frames
+    # If we have a real sequence from the manifest (e.g. trajectory), use it
+    if manifest_frames and len(manifest_frames) > 1:
+        return manifest_frames
+
+    # Otherwise, fallback to globbing to see if we have per-iteration frames
+    glob_frames = collect_glob_frames(run_dir, scene=scene, pattern=pattern)
+    if glob_frames and len(glob_frames) > 1:
+        # If we found iter_*.png files, exclude final_*.png so it doesn't sort to the front
+        has_iters = any("iter_" in f.name for f in glob_frames)
+        if has_iters:
+            glob_frames = [f for f in glob_frames if not f.name.startswith("final")]
+        return glob_frames
+
+    if manifest_frames:
+        return manifest_frames
+
+    if glob_frames:
+        return glob_frames
 
     scene_hint = f" for scene {scene!r}" if scene is not None else ""
     raise FileNotFoundError(

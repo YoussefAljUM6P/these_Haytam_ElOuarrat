@@ -25,12 +25,13 @@
 set -euo pipefail
 export QT_QPA_PLATFORM=offscreen
 
-REPO_ROOT="/home/haytam.elouarrat/lustre/med_img-z2y8h4a967e/code_Haytam"
-GS_DIR="$REPO_ROOT/gaussian-splatting"
-READER="$GS_DIR/scene/dataset_readers.py"
 PIPE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BENCH_360="$REPO_ROOT/gs_benchmark_360"
-MOGE_SCRIPT="$REPO_ROOT/SERVIS/SRC/make_moge_depths.py"
+SERVIS_DIR="${SERVIS_DIR:-$(cd "$PIPE_DIR/.." && pwd)}"
+REPO_ROOT="${SERVIS_WORKSPACE_ROOT:-$(dirname "$SERVIS_DIR")}"
+GS_DIR="${GS_DIR:-$REPO_ROOT/gaussian-splatting}"
+READER="$GS_DIR/scene/dataset_readers.py"
+BENCH_360="${BENCH_360:-$REPO_ROOT/gs_benchmark_360}"
+MOGE_SCRIPT="$SERVIS_DIR/SRC/make_moge_depths.py"
 
 GS_ENV="gaussian_splatting"
 SERVIS_ENV="servis"         # has MoGe-2 + joblib (for make_depth_scale.py)
@@ -42,8 +43,12 @@ DENSIFY_UNTIL=20000
 GRAD_THRESHOLD=0.00015
 DEPTHS_NAME="depths"        # <scene>/depths, passed as -d depths
 
-NTFY="ntfy.sh/HPC"
+NTFY="${SERVIS_NTFY_TOPIC:-}"
 # ─────────────────────────────────────────────────────────────────────────────
+
+notify() {
+    [ -z "$NTFY" ] || curl -fsS -d "$1" "$NTFY" >/dev/null || true
+}
 
 DATASETS_ROOT="${1:?Usage: bash run_moge_mip360.sh <datasets_root> [N] [scene]}"
 DATASETS_ROOT="$(realpath "${DATASETS_ROOT%/}")"
@@ -83,7 +88,7 @@ fi
 module load "$CUDA_MODULE" 2>/dev/null || true
 [ -f "$CSV" ] || echo "scene,PSNR,LPIPS,SSIM" > "$CSV"
 
-trap 'curl -d "❌ moge mip360 FAILED at: ${SCENE:-unknown}" '"$NTFY"' || true' ERR
+trap 'notify "❌ moge mip360 FAILED at: ${SCENE:-unknown}"' ERR
 
 conda_on "$GS_ENV"
 
@@ -92,7 +97,7 @@ for SCENE in "${SCENES[@]}"; do
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "🗂️  $SCENE  (MoGe variant)"
     [ -f "$SCENE_DIR/sparse/0/images.bin" ] || { echo "    ⚠ no sparse/0 — skipping"; continue; }
-    curl -d "🚀 moge mip360 start: $SCENE" "$NTFY" || true
+    notify "🚀 moge mip360 start: $SCENE"
 
     OUTPUT="$SCENE_DIR/output_moge"
     DEPTHS_DIR="$SCENE_DIR/$DEPTHS_NAME"
@@ -151,7 +156,7 @@ for SCENE in "${SCENES[@]}"; do
 
     # 4) CSV
     python "$COLLECTOR" --scene "$SCENE" --results "$OUTPUT/results.json" --csv "$CSV"
-    curl -d "✅ moge mip360 done: $SCENE" "$NTFY" || true
+    notify "✅ moge mip360 done: $SCENE"
 done
 
 conda_off
@@ -160,4 +165,4 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "📄 MoGe metrics → $CSV"
 column -t -s, "$CSV" 2>/dev/null || cat "$CSV"
 echo "Compare against the no-depth baseline in $DATASETS_ROOT/metrics.csv"
-curl -d "🎉 moge mip360 done: ${SCENES[*]}" "$NTFY" || true
+notify "🎉 moge mip360 done: ${SCENES[*]}"

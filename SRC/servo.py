@@ -1,7 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 from time import perf_counter
-from typing import Optional, Union, Tuple, List, Dict, Callable, Any
+from typing import Optional, Union, Tuple, Dict, Callable, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -313,6 +313,19 @@ def run_servo_loop(
         )
         hard_limit_saturated = bool(exceeds_hard_translation or exceeds_hard_rotation)
 
+        if hard_limit_saturated:
+            return (
+                np.zeros(6, dtype=np.float32),
+                _motion_info(
+                    raw_velocity,
+                    np.zeros(6, dtype=np.float32),
+                    velocity_limited=True,
+                    velocity_scale=0.0,
+                    hard_limit_saturated=True,
+                ),
+                "velocity_invalid_hard_limit"
+            )
+
         scales = []
         if (
             max_translation_step is not None
@@ -345,23 +358,41 @@ def run_servo_loop(
     for iteration in range(iterations):
         iter_t0 = perf_counter()
 
-        if use_tensor_render:
-            if cuda_events is not None:
-                render_start, render_end, controller_end = cuda_events
-                render_start.record()
-                rendered = render_tensor(camera)
-                render_end.record()
-                velocity = np.asarray(
-                    controller(rendered, target_image, camera, iteration),
-                    dtype=np.float32,
-                )
-                controller_end.record()
-                controller_end.synchronize()
-                render_dt = render_start.elapsed_time(render_end) / 1000.0
-                controller_dt = render_end.elapsed_time(controller_end) / 1000.0
+        render_dt = 0.0
+        controller_dt = 0.0
+        exception_stop_reason = None
+        exception_detail = None
+        exception_traceback = None
+
+        try:
+            if use_tensor_render:
+                if cuda_events is not None:
+                    render_start, render_end, controller_end = cuda_events
+                    render_start.record()
+                    rendered = render_tensor(camera)
+                    render_end.record()
+                    velocity = np.asarray(
+                        controller(rendered, target_image, camera, iteration),
+                        dtype=np.float32,
+                    )
+                    controller_end.record()
+                    controller_end.synchronize()
+                    render_dt = render_start.elapsed_time(render_end) / 1000.0
+                    controller_dt = render_end.elapsed_time(controller_end) / 1000.0
+                else:
+                    t0 = perf_counter()
+                    rendered = render_tensor(camera)
+                    render_dt = perf_counter() - t0
+
+                    t0 = perf_counter()
+                    velocity = np.asarray(
+                        controller(rendered, target_image, camera, iteration),
+                        dtype=np.float32,
+                    )
+                    controller_dt = perf_counter() - t0
             else:
                 t0 = perf_counter()
-                rendered = render_tensor(camera)
+                rendered = scene.render(camera)
                 render_dt = perf_counter() - t0
 
                 t0 = perf_counter()
@@ -370,23 +401,31 @@ def run_servo_loop(
                     dtype=np.float32,
                 )
                 controller_dt = perf_counter() - t0
-        else:
-            t0 = perf_counter()
-            rendered = scene.render(camera)
-            render_dt = perf_counter() - t0
+        except Exception as exc:
+            import traceback
+            stage = "controller" if "rendered" in locals() else "render"
+            exception_stop_reason = f"{stage}_exception"
+            exception_detail = f"{type(exc).__name__}: {exc}"
+            exception_traceback = traceback.format_exc()
+            velocity = np.zeros(6, dtype=np.float32)
 
-            t0 = perf_counter()
-            velocity = np.asarray(
-                controller(rendered, target_image, camera, iteration),
-                dtype=np.float32,
-            )
-            controller_dt = perf_counter() - t0
         render_total += render_dt
         controller_total += controller_dt
 
         controller_info = getattr(controller, "last_info", {})
-        controller_stop_reason = _controller_stop_reason()
+        controller_stop_reason = (
+            _controller_stop_reason()
+            if exception_stop_reason is None
+            else exception_stop_reason
+        )
         stop_reason_for_iteration = controller_stop_reason
+
+        if exception_stop_reason is not None:
+            controller_info = dict(controller_info)
+            controller_info["fault_reason"] = exception_stop_reason
+            controller_info["fault_detail"] = exception_detail
+            controller_info["traceback"] = exception_traceback
+
         step_accepted = False
         raw_velocity = velocity
         applied_velocity = np.zeros(6, dtype=np.float32)

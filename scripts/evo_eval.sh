@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -e
 
-RUN_PATH="$1"
-
-BASE_ROOT="/home/haytam-elourrat/SERVIS/RUNS/trajectory"
+RUN_PATH="${1:-}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_ROOT="${SERVIS_RUNS_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)/RUNS}"
 
 if [ -z "$RUN_PATH" ]; then
   echo "Usage:"
@@ -11,7 +11,11 @@ if [ -z "$RUN_PATH" ]; then
   exit 1
 fi
 
-RUN_DIR="$BASE_ROOT/$RUN_PATH/"
+if [[ "$RUN_PATH" = /* ]]; then
+  RUN_DIR="${RUN_PATH%/}/"
+else
+  RUN_DIR="$BASE_ROOT/${RUN_PATH%/}/"
+fi
 
 GT="$RUN_DIR/gt_traj.tum"
 SIM="$RUN_DIR/sim_traj.tum"

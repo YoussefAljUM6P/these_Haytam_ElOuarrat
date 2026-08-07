@@ -52,6 +52,8 @@ METRIC_ROWS = (
     ("ape_rot_rmse", "ape_rotation_deg", "rmse"),
     ("rpe_trans_rmse", "rpe_translation", "rmse"),
     ("rpe_rot_rmse", "rpe_rotation_deg", "rmse"),
+    ("avg_fps", "timing", "fps"),
+    ("avg_render_ms", "timing", "render_ms_mean"),
 )
 
 # Preset axes -> ordered list of (variant name, override dict).
@@ -134,6 +136,10 @@ def add_arguments(parser):
                         help="Override feature refresh ratio for every cell.")
     parser.add_argument("--min-features", type=int, default=None,
                         help="Override minimum IBVS feature count for every cell.")
+    parser.add_argument("--diverge-translation-error", type=float, default=None,
+                        help="Override final translation-error divergence threshold for every cell.")
+    parser.add_argument("--diverge-rotation-error-deg", type=float, default=None,
+                        help="Override final rotation-error divergence threshold for every cell.")
     parser.add_argument("--save-task-viz", action="store_true",
                         help="Keep per-task final-vs-target images.")
     parser.add_argument(
@@ -249,6 +255,8 @@ def optional_overrides(args) -> Dict[str, object]:
         "gain": args.gain,
         "ratio": args.ratio,
         "min_features": args.min_features,
+        "diverge_translation_error": args.diverge_translation_error,
+        "diverge_rotation_error_deg": args.diverge_rotation_error_deg,
     }
     return {k: v for k, v in optional.items() if v is not None}
 
@@ -318,8 +326,9 @@ def metrics_from_summary(run_root: Optional[Path], dataset: str):
         return empty_metrics(), str(metrics["error"])
 
     out = empty_metrics()
+    timing = scene.get("timing", {})
     for label, family, stat in METRIC_ROWS:
-        fam = metrics.get(family)
+        fam = timing if family == "timing" else metrics.get(family)
         if isinstance(fam, dict) and fam.get(stat) is not None:
             out[label] = float(fam[stat])
     return out, None
@@ -480,7 +489,9 @@ def run(args):
         status = cell["status"]
         if status in ("ok",):
             print(f"  ok: ape_trans_rmse={fmt(cell['metrics']['ape_trans_rmse'])} "
-                  f"ape_rot_rmse={fmt(cell['metrics']['ape_rot_rmse'])}")
+                  f"ape_rot_rmse={fmt(cell['metrics']['ape_rot_rmse'])} "
+                  f"avg_fps={fmt(cell['metrics']['avg_fps'])} "
+                  f"avg_render_ms={fmt(cell['metrics']['avg_render_ms'])}")
         else:
             print(f"  {status}: {cell['error']}")
             if status == "failed" and args.fail_fast:

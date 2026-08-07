@@ -100,6 +100,7 @@ def build_parser():
         info["runner"].add_arguments(sp)
 
     sub.add_parser("wizard", help="Interactive questionary wizard (default).")
+    sub.add_parser("bot", help="Telegram phone-control bot (remote launcher).")
 
     return parser
 
@@ -116,7 +117,7 @@ TASKS = {
     "resume_trajectory": {
         "kind": "trajectory",
         "command": "trajectory",
-        "label": "Resume     — continue one of the last 15 trajectory runs",
+        "label": "Resume     — continue a trajectory run",
     },
     "compare_table": {
         "kind": "trajectory",
@@ -147,6 +148,11 @@ TASKS = {
         "kind": "video",
         "command": "video",
         "label": "Video      — compile a run's visualizations into one MP4 (variable FPS)",
+    },
+    "filter_runs": {
+        "kind": "filter",
+        "command": "filter",
+        "label": "Filter     — browse runs by recon type / controller / scene",
     },
 }
 
@@ -199,6 +205,39 @@ def scene_task_count(scene_dir):
     if poses is None or poses < 2:
         return None
     return poses - 1
+
+
+def scene_takes(scene_dir):
+    """Return the scene's takes as ``[{index, count, start_frame, end_frame}]``.
+
+    Prefers a cached ``takes.json``; if absent, detects takes from the COLMAP
+    poses and writes it (so the trajectory runner reuses the same segmentation).
+    ``index`` is 1-based to match how takes are shown and selected. Returns an
+    empty list when the scene has no COLMAP model or detection fails.
+    """
+    scene_dir = Path(scene_dir)
+    from takes import load_takes, compute_takes_for_scene, save_takes
+
+    data = load_takes(scene_dir)
+    if data is None:
+        if not (scene_dir / "sparse" / "0").is_dir():
+            return []
+        try:
+            data = compute_takes_for_scene(scene_dir)
+            save_takes(scene_dir, data)
+        except Exception:
+            return []
+
+    out = []
+    for k, take in enumerate(data.get("takes", []), start=1):
+        count = int(take.get("count", len(take.get("frames", []))))
+        out.append({
+            "index": k,
+            "count": count,
+            "start_frame": take.get("start_frame"),
+            "end_frame": take.get("end_frame"),
+        })
+    return out
 
 
 def list_scenes():
@@ -332,6 +371,22 @@ def wizard():
         console.print(Panel(text, border_style="cyan", padding=(0, 2)))
 
     def scene_table(scenes):
+        psnr_data = {}
+        # Load custom PSNRs if any
+        try:
+            with open(DATA_ROOT / "psnr.json") as f:
+                psnr_data = json.load(f)
+        except Exception:
+            pass
+
+        def _format_cell(scene_name, renderer, rs):
+            if renderer not in rs:
+                return "[grey50]·[/]"
+            val = psnr_data.get(scene_name, {}).get(renderer)
+            if val is not None:
+                return f"[green]{val}[/]"
+            return "[green]✓[/]"
+
         table = Table(
             title="Detected scenes in DATA/",
             title_style="bold cyan",
@@ -348,9 +403,9 @@ def wizard():
             table.add_row(
                 name,
                 str(n_tasks) if n_tasks is not None else "[grey50]·[/]",
-                "[green]✓[/]" if "mesh" in rs else "[grey50]·[/]",
-                "[green]✓[/]" if "gs" in rs else "[grey50]·[/]",
-                "[green]✓[/]" if "nerf" in rs else "[grey50]·[/]",
+                _format_cell(name, "mesh", rs),
+                _format_cell(name, "gs", rs),
+                _format_cell(name, "nerf", rs),
             )
         console.print(table)
 
@@ -440,6 +495,10 @@ def wizard():
         return True
 
     _MANUAL_RUN = "__manual_run_path__"
+    # The picker discovers a bounded pool of the most-recent runs and shows up to
+    # select_run's display_limit of them; anything older is reached by typing a
+    # path via the manual-path entry.
+    _RUN_POOL_LIMIT = 200
 
     def run_choice_label(info):
         when = datetime.fromtimestamp(info["mtime"]).strftime("%Y-%m-%d %H:%M")
@@ -462,22 +521,37 @@ def wizard():
                 return cand.resolve()
         return None
 
-    def select_run(message, runs, choice_label, requires=(), validate=None):
-        """Run picker with a 'enter a path manually' escape hatch.
+    def select_run(message, runs, choice_label, requires=(), validate=None,
+                   display_limit=15):
+        """Run picker with a manual-path escape hatch.
 
-        Shows the discovered ``runs`` plus a "📁 Enter a run path manually…"
-        choice. Picking that prompts for a path (absolute / ~ / relative to
-        RUNS/), checks it contains every file in ``requires`` and passes the
-        optional ``validate(info) -> error_or_None`` gate, then returns a fresh
+        Shows up to ``display_limit`` runs (most recent first), a hint when more
+        exist, and a "📁 Enter a run path manually…" entry. Picking that prompts
+        for a path (absolute / ~ / relative to RUNS/), checks it contains every
+        file in ``requires`` and passes the optional
+        ``validate(info) -> error_or_None`` gate, then returns a fresh
         ``build_resume_info`` dict — same shape the discover_* functions yield.
         A blank path goes back. Listed runs are returned as-is. Raises GoBack
         on « Back.
         """
-        choices = [Choice(choice_label(info), value=info) for info in runs]
+        choices = [
+            Choice(choice_label(info), value=info)
+            for info in runs[:display_limit]
+        ]
+        hidden = len(runs) - display_limit
+        if hidden > 0:
+            choices.append(
+                Choice(
+                    f"   … {hidden} older run(s) not shown — use the manual path",
+                    value=_MANUAL_RUN,
+                )
+            )
         choices.append(Choice("📁 Enter a run path manually…", value=_MANUAL_RUN))
+
         selected = ask_select_with_back(
             message, choices, default=(runs[0] if runs else None)
         )
+
         if selected is not _MANUAL_RUN:
             return selected
 
@@ -573,7 +647,7 @@ def wizard():
         return [f"{key}={json.dumps(value)}" for key, value in sorted(cfg.items())]
 
     def run_resume_wizard():
-        runs = discover_resume_runs(limit=15)
+        runs = discover_resume_runs(limit=_RUN_POOL_LIMIT)
         if not runs:
             console.print(
                 f"[yellow]No resumable trajectory runs auto-detected under "
@@ -849,7 +923,7 @@ def wizard():
         return runs[:limit]
 
     def run_plot_wizard():
-        runs = discover_plot_runs(limit=15)
+        runs = discover_plot_runs(limit=_RUN_POOL_LIMIT)
         if not runs:
             console.print(
                 f"[yellow]No runs with sim_traj.tum + gt_traj.tum auto-detected under "
@@ -884,25 +958,15 @@ def wizard():
                 requires=("sim_traj.tum", "gt_traj.tum"),
             )
 
-            # If the run has multiple takes, offer to plot just one of them.
-            take = None
+            # Multi-take runs are always saved in full: one combined trajectory
+            # plus one independent plot set per take (evo_plots/take_<k>/). No
+            # take selection — the runner emits them all.
             windows = runner_plot.read_take_windows(selected["path"])
             if len(windows) > 1:
-                take_choices = [
-                    Choice("All takes (combined trajectory)", value=None)
-                ]
-                for w in windows:
-                    take_choices.append(
-                        Choice(
-                            f"Take {w['take']} — tasks {w['task_start']}–{w['task_end']} "
-                            f"({w['n_tasks']} tasks)",
-                            value=w["take"],
-                        )
-                    )
-                take = ask_select_with_back(
-                    f"This run has {len(windows)} takes — plot which?",
-                    take_choices,
-                    default=take_choices[0],
+                console.print(
+                    f"[grey50]This run has {len(windows)} takes — saving the "
+                    f"combined trajectory plus all {len(windows)} takes "
+                    f"independently.[/]"
                 )
 
             rpe_delta = ask_text("RPE delta (frames):", 1, int)
@@ -918,7 +982,6 @@ def wizard():
             run=str(selected["path"]),
             rpe_delta=int(rpe_delta),
             out=out,
-            take=take,
             list_takes=False,
         )
         runner_plot.run(runner_args)
@@ -951,7 +1014,7 @@ def wizard():
         return runs[:limit]
 
     def run_video_wizard():
-        runs = discover_video_runs(limit=15)
+        runs = discover_video_runs(limit=_RUN_POOL_LIMIT)
         if not runs:
             console.print(
                 f"[yellow]No runs with saved visualizations auto-detected under "
@@ -1025,10 +1088,201 @@ def wizard():
         runner_video.run(runner_args)
         return 0
 
+    def discover_all_runs(limit=500):
+        """Every run dir under RUNS/ carrying a resolved config, newest first."""
+        runs_root = PROJECT_ROOT / "RUNS"
+        if not runs_root.is_dir():
+            return []
+        runs = []
+        for entry in runs_root.iterdir():
+            if not entry.is_dir():
+                continue
+            if not (entry / "config.resolved.json").exists():
+                continue
+            runs.append(build_resume_info(entry))
+        runs.sort(key=lambda item: item["mtime"], reverse=True)
+        return runs[:limit]
+
+    def run_filter_wizard():
+        """Browse runs filtered by recon type (renderer), controller and scene.
+
+        Every filter is a menu choice (never free text); "— any —" is a
+        wildcard that ANDs with the others. Matching runs are printed as a
+        table. This is a read-only browser, so it always returns to the main
+        menu (via "__back__").
+        """
+        runs = discover_all_runs()
+        if not runs:
+            console.print(
+                f"[yellow]No runs with a resolved config found under "
+                f"{PROJECT_ROOT / 'RUNS'}.[/]"
+            )
+            return "__back__"
+
+        scenes = sorted({r["scene"] for r in runs if r.get("scene")})
+        ANY = "__any__"
+
+        def _choices(pairs):
+            return [Choice("— any —", value=ANY)] + [
+                Choice(label, value=value) for label, value in pairs
+            ]
+
+        while True:
+            try:
+                recon = ask_select_with_back(
+                    "Reconstruction type (renderer):",
+                    _choices([("mesh", "mesh"), ("gs", "gs"), ("nerf", "nerf")]),
+                    default=ANY,
+                )
+                controller = ask_select_with_back(
+                    "Controller:",
+                    _choices([
+                        ("ibvs  (FBVS / feature-based)", "ibvs"),
+                        ("photometric  (PVS)", "photometric"),
+                    ]),
+                    default=ANY,
+                )
+                scene = ask_select_with_back(
+                    "Scene:",
+                    _choices([(s, s) for s in scenes]),
+                    default=ANY,
+                )
+            except GoBack:
+                return "__back__"
+
+            def _keep(info, _recon=recon, _controller=controller, _scene=scene):
+                cfg = info["resolved"]
+                if _recon is not ANY and cfg.get("renderer") != _recon:
+                    return False
+                if _controller is not ANY and cfg.get("controller") != _controller:
+                    return False
+                if _scene is not ANY and info.get("scene") != _scene:
+                    return False
+                return True
+
+            matches = [r for r in runs if _keep(r)]
+            active = " ".join(
+                f"{name}={val}"
+                for name, val in (("recon", recon), ("controller", controller),
+                                  ("scene", scene))
+                if val is not ANY
+            ) or "none"
+
+            if not matches:
+                console.print(
+                    f"[yellow]No runs match filter[/] ([grey50]{active}[/]); "
+                    f"{len(runs)} run(s) total."
+                )
+            else:
+                table = Table(
+                    title=f"Runs matching: {active}  ({len(matches)} of {len(runs)})",
+                    title_style="bold cyan",
+                    border_style="grey50",
+                    header_style="bold",
+                )
+                table.add_column("#", justify="right", style="cyan")
+                table.add_column("modified", style="green")
+                table.add_column("run")
+                table.add_column("scene")
+                table.add_column("recon")
+                table.add_column("controller")
+                table.add_column("depth")
+                table.add_column("tasks", justify="right")
+                for idx, info in enumerate(matches, start=1):
+                    cfg = info["resolved"]
+                    table.add_row(
+                        str(idx),
+                        datetime.fromtimestamp(info["mtime"]).strftime("%Y-%m-%d %H:%M"),
+                        str(info["path"].relative_to(PROJECT_ROOT)),
+                        info["scene"],
+                        str(cfg.get("renderer", "?")),
+                        str(cfg.get("controller", "?")),
+                        str(cfg.get("depth_mode", "?")),
+                        str(info["progress"]["tasks_done"]),
+                    )
+                console.print(table)
+
+            nxt = ask_select(
+                "Next:",
+                [
+                    Choice("Filter again", value="again"),
+                    Choice("Back to main menu", value="menu"),
+                ],
+                default="menu",
+            )
+            if nxt == "menu":
+                return "__back__"
+
     def discover_copy_runs(controller_type, limit=15):
         runs = discover_resume_runs(limit=100)
         filtered = [r for r in runs if r["resolved"].get("controller") == controller_type]
         return filtered[:limit]
+
+    def ask_checkbox(message, choices):
+        result = questionary.checkbox(
+            message, choices=choices, style=QSTYLE, qmark="›"
+        ).ask()
+        if result is None:
+            raise KeyboardInterrupt
+        return result
+
+    def run_takes_wizard(scene_name, default_indices=None):
+        """Choose which capture takes to run for a trajectory.
+
+        Returns ``(selection, interactive)`` where ``selection`` is None to run
+        the whole trajectory (all takes, back-to-back) or a 1-based list of take
+        indices, and ``interactive`` says whether the user was actually prompted.
+        Raises GoBack for the « Back choice. When the scene has 0/1 takes there
+        is nothing to choose, so returns ``(None, False)``.
+        """
+        takes = scene_takes(DATA_ROOT / scene_name)
+        if len(takes) <= 1:
+            if len(takes) == 1:
+                console.print(
+                    "[grey50]Scene has a single take — running the whole "
+                    "trajectory.[/]"
+                )
+            return None, False
+
+        total_tasks = sum(max(0, t["count"] - 1) for t in takes)
+        console.print(
+            f"[grey50]{len(takes)} takes detected "
+            f"(~{total_tasks} tasks total @ stride 1).[/]"
+        )
+        mode = ask_select_with_back(
+            "Which takes?",
+            [
+                Choice(
+                    f"Whole trajectory — all {len(takes)} takes "
+                    f"(~{total_tasks} tasks)",
+                    value="whole",
+                ),
+                Choice("Pick specific takes…", value="pick"),
+            ],
+            default="whole",
+        )
+        if mode == "whole":
+            return None, True
+
+        default_set = set(default_indices or [])
+        take_choices = [
+            Choice(
+                f"take {t['index']}  ·  ~{max(0, t['count'] - 1)} tasks  "
+                f"({t['count']} frames)  "
+                f"[{t['start_frame']} → {t['end_frame']}]",
+                value=t["index"],
+                checked=(t["index"] in default_set),
+            )
+            for t in takes
+        ]
+        while True:
+            picked = ask_checkbox(
+                "Select takes to run (space to toggle, enter to confirm):",
+                take_choices,
+            )
+            if picked:
+                return sorted(picked), True
+            console.print("[yellow]Select at least one take.[/]")
 
     banner()
     state = "TASK"
@@ -1037,6 +1291,8 @@ def wizard():
     controller = "ibvs"
     cfg = {}
     fast_forward = False
+    take_indices_sel = None
+    takes_selectable = False
 
     while True:
         try:
@@ -1056,6 +1312,8 @@ def wizard():
                     state = "PLOT_RUN"
                 elif task_key == "video_run":
                     state = "VIDEO_RUN"
+                elif task_key == "filter_runs":
+                    state = "FILTER_RUNS"
                 else:
                     state = "CONTROLLER"
 
@@ -1075,6 +1333,13 @@ def wizard():
 
             elif state == "VIDEO_RUN":
                 res = run_video_wizard()
+                if res == "__back__":
+                    state = "TASK"
+                else:
+                    return res
+
+            elif state == "FILTER_RUNS":
+                res = run_filter_wizard()
                 if res == "__back__":
                     state = "TASK"
                 else:
@@ -1194,6 +1459,13 @@ def wizard():
                 if not scene_renderers:
                     console.print(f"[red]Scene {scene_name!r} has no renderable assets.[/]")
                     continue
+                # Only trajectory runs are take-partitioned; servo_frames isn't.
+                state = "TAKES" if task_key == "trajectory" else "QUESTIONS"
+
+            elif state == "TAKES":
+                take_indices_sel, takes_selectable = run_takes_wizard(
+                    scene_name, default_indices=take_indices_sel
+                )
                 state = "QUESTIONS"
 
             elif state == "QUESTIONS":
@@ -1234,6 +1506,11 @@ def wizard():
                             scene_renderers,
                             wizard_ctx,
                         )
+                        # A specific take selection implies take-partitioning;
+                        # "whole trajectory" leaves the schema default (all takes).
+                        if take_indices_sel:
+                            cfg["use_takes"] = True
+                            cfg["take_indices"] = list(take_indices_sel)
 
                 console.print()
                 console.print(
@@ -1283,15 +1560,25 @@ def wizard():
                 "RESUME": "TASK",
                 "PLOT_RUN": "TASK",
                 "VIDEO_RUN": "TASK",
+                "FILTER_RUNS": "TASK",
                 "INSPECT_SCENE": "TASK",
                 "INSPECT_OPTIONS": "INSPECT_SCENE",
                 "CONTROLLER": "TASK",
                 "COPY_SETTINGS": "CONTROLLER",
                 "SCENE": "COPY_SETTINGS",
-                "QUESTIONS": "COPY_SETTINGS" if task_key == "compare_table" else "SCENE",
+                "TAKES": "SCENE",
                 "ACTION": "QUESTIONS",
             }
-            state = back_map.get(state, "TASK")
+            if state == "QUESTIONS":
+                if task_key == "compare_table":
+                    back = "COPY_SETTINGS"
+                elif task_key == "trajectory" and takes_selectable:
+                    back = "TAKES"
+                else:
+                    back = "SCENE"
+                state = back
+            else:
+                state = back_map.get(state, "TASK")
 
 
 # ---- entry point -----------------------------------------------------------
@@ -1307,6 +1594,12 @@ def main():
         except KeyboardInterrupt:
             print("\nabort (Ctrl-C)")
             return 130
+
+    if args.command == "bot":
+        # Lazy import: only the bot needs python-telegram-bot.
+        import phone_bot
+        phone_bot.run(args)
+        return 0
 
     dispatch(args)
     return 0

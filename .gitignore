@@ -102,10 +102,31 @@ SRC/output_gs.png
 CONFIGS/cli_*_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9].json
 
 # =============================================================================
+# Local research library / generated report artifacts
+# =============================================================================
+/PAPERS/
+/OURS/
+/DOCS/
+/Benchmark*.csv
+/difficulty_convergence.csv
+/difficulty_convergence.pdf
+/difficulty_convergence.png
+/parsed_data.json
+*.orig
+*.bak
+*.rej
+*.aux
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+
+# =============================================================================
 # Scratch / one-off rewrites at repo root
 # =============================================================================
 /rewrite_*.py
 /type_feature.py
+/parse_pdfs.py
 /scratch/
 /tmp/
 /_tmp/

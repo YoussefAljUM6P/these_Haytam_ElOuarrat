@@ -8,9 +8,8 @@ Implements the basic IBVS scheme:
 """
 
 from __future__ import annotations
-from typing import Optional, Union, Tuple, List, Dict, Callable, Any
+from typing import Optional, Tuple, Dict, Callable, Any
 
-import cv2
 import numpy as np
 from numpy.typing import NDArray
 from scipy.stats import median_abs_deviation
@@ -262,6 +261,8 @@ class IBVSController:
         adaptive_gain: bool = True,
         velocity_alpha: float = 0.8,
         stop_residual_px: float = 0.5,
+        stop_plateau_iters: Optional[int] = None,
+        stop_plateau_ratio: float = 0.99,
         min_interaction_rank: int = DEFAULT_MIN_INTERACTION_RANK,
         max_interaction_condition: Optional[float] = DEFAULT_MAX_INTERACTION_CONDITION,
     ) -> None:
@@ -281,6 +282,10 @@ class IBVSController:
         # Stop when per-feature mean pixel error (RMS over 2N components) drops
         # below this threshold. Default 0.5 px ~ subpixel agreement.
         self.stop_residual_px = float(stop_residual_px)
+        self.stop_plateau_iters = int(stop_plateau_iters) if stop_plateau_iters is not None else None
+        self.stop_plateau_ratio = float(stop_plateau_ratio)
+        self.best_rms = float("inf")
+        self.plateau_count = 0
         (
             self.min_interaction_rank,
             self.max_interaction_condition,
@@ -452,10 +457,31 @@ class IBVSController:
                     fault_reason = interaction_fault
                     velocity = np.zeros(6, dtype=np.float32)
                 else:
-                    # Control law: v_c = -lambda * pinv(L_e) * e (paper eq. 5).
-                    velocity = (-self.gain * (np.linalg.pinv(L) @ error)).astype(np.float32)
+                    # Implement damped least squares, adaptive gain, and velocity smoothing (C1)
+                    H = L.T @ L
+                    g = L.T @ error
+                    if self.damping > 0.0:
+                        diag_H = np.maximum(np.diag(H), 1e-12)
+                        H_reg = H + self.damping * np.diag(diag_H)
+                        try:
+                            step = np.linalg.solve(H_reg, g)
+                        except np.linalg.LinAlgError:
+                            step = np.linalg.pinv(L) @ error
+                    else:
+                        step = np.linalg.pinv(L) @ error
+
+                    lambda_gain = self.gain
+                    if self.adaptive_gain:
+                        # Exponential decay on error norm
+                        lambda_gain = self.gain * float(np.exp(-np.linalg.norm(error)))
+
+                    velocity = (-lambda_gain * step).astype(np.float32)
+                    if self.prev_velocity is not None:
+                        velocity = (self.velocity_alpha * velocity + (1.0 - self.velocity_alpha) * self.prev_velocity).astype(np.float32)
+                    self.prev_velocity = velocity.copy()
         else:
             velocity = np.zeros(6, dtype=np.float32)
+            self.prev_velocity = None
 
         n_components = int(error.size)
         residual_norm = float(np.linalg.norm(error)) if n_components else float("nan")
@@ -513,8 +539,18 @@ class IBVSController:
         rms = self.last_info.get("residual_rms_px")
         if rms is None or not np.isfinite(float(rms)):
             return None
-        if float(rms) <= self.stop_residual_px:
+        rms = float(rms)
+        if rms <= self.stop_residual_px:
             return "ibvs_rms_below_threshold"
+
+        if self.stop_plateau_iters is not None:
+            if rms < self.best_rms * self.stop_plateau_ratio:
+                self.best_rms = rms
+                self.plateau_count = 0
+            else:
+                self.plateau_count += 1
+                if self.plateau_count >= self.stop_plateau_iters:
+                    return "plateau"
         return None
 
     def feature_error_px(

@@ -93,7 +93,13 @@ class FeatureMatcher:
             self._target_image = target
             self._target_features = out2
 
-        idxs0, idxs1 = self.extractor.match(out1['descriptors'], out2['descriptors'], min_cossim=-1)
+        descriptors1 = out1['descriptors']
+        descriptors2 = out2['descriptors']
+        if descriptors1.shape[0] == 0 or descriptors2.shape[0] == 0:
+            empty = np.empty((0, 2), dtype=np.float32)
+            return empty, empty.copy()
+
+        idxs0, idxs1 = self.extractor.match(descriptors1, descriptors2, min_cossim=-1)
         kpts1 = out1['keypoints'][idxs0].cpu().numpy()
         kpts2 = out2['keypoints'][idxs1].cpu().numpy()
         return kpts1.astype(np.float32, copy=False), kpts2.astype(np.float32, copy=False)

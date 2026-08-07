@@ -87,7 +87,7 @@ def estimate_pose_pnp(pts3d, pts2d, K):
     success, rvec, tvec, inliers = cv2.solvePnPRansac(pts3d, pts2d, K, None)
 
     if not success or inliers is None or len(inliers) < 10:
-        raise ValueError(f"PnP failed or insufficient inliers")
+        raise ValueError("PnP failed or insufficient inliers")
 
     if len(inliers) / len(pts2d) < 0.5:
         raise ValueError(f"Too many outliers: {len(inliers)}/{len(pts2d)} inliers")

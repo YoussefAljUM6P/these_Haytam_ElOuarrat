@@ -212,11 +212,24 @@ class GSScene:
         """Render an HWC float32 image on CUDA without a host readback."""
         self._last_camera = camera
 
+        W, H = camera.W, camera.H
+        fx, fy, cx, cy = camera.fx, camera.fy, camera.cx, camera.cy
+        render_scale = 1.0
+        MIN_W = 800
+        if W < MIN_W:
+            render_scale = float(math.ceil(MIN_W / float(W)))
+            W = int(W * render_scale)
+            H = int(H * render_scale)
+            fx *= render_scale
+            fy *= render_scale
+            cx *= render_scale
+            cy *= render_scale
+
         # tan(fov/2) values are used by the rasterizer to recover focal lengths
         # for the screen-space covariance Jacobian: focal = size / (2 * tanfov).
         # Off-center cx, cy is handled via the asymmetric projection matrix below.
-        tanfovx = camera.W / (2.0 * camera.fx)
-        tanfovy = camera.H / (2.0 * camera.fy)
+        tanfovx = W / (2.0 * fx)
+        tanfovy = H / (2.0 * fy)
 
         viewmatrix = (
             torch.from_numpy(np.ascontiguousarray(camera.T_cam_world))
@@ -224,9 +237,7 @@ class GSScene:
             .transpose(0, 1)
             .cuda(non_blocking=True)
         )
-        projmatrix = self._get_proj(
-            camera.fx, camera.fy, camera.cx, camera.cy, camera.W, camera.H
-        )
+        projmatrix = self._get_proj(fx, fy, cx, cy, W, H)
 
         # Pytorch's bmm expects (B, N, M), we unsqueeze and squeeze
         full_projmatrix = (viewmatrix.unsqueeze(0).bmm(projmatrix.unsqueeze(0))).squeeze(0)
@@ -238,8 +249,8 @@ class GSScene:
         )
 
         raster_settings = GaussianRasterizationSettings(
-            image_height=camera.H,
-            image_width=camera.W,
+            image_height=H,
+            image_width=W,
             tanfovx=tanfovx,
             tanfovy=tanfovy,
             bg=self._bg,
@@ -267,6 +278,14 @@ class GSScene:
             )
         rendered_image = outputs[0]
 
+        if render_scale > 1.0:
+            import torch.nn.functional as F
+            rendered_image = F.interpolate(
+                rendered_image.unsqueeze(0),
+                size=(camera.H, camera.W),
+                mode='area'
+            ).squeeze(0)
+
         return rendered_image.permute(1, 2, 0).clamp(0, 1)
 
     def render(self, camera):
@@ -282,8 +301,21 @@ class GSScene:
         if depth_key == self._last_depth_key:
             return self._last_depth.copy()
 
-        tanfovx = camera.W / (2.0 * camera.fx)
-        tanfovy = camera.H / (2.0 * camera.fy)
+        W, H = camera.W, camera.H
+        fx, fy, cx, cy = camera.fx, camera.fy, camera.cx, camera.cy
+        render_scale = 1.0
+        MIN_W = 800
+        if W < MIN_W:
+            render_scale = float(math.ceil(MIN_W / float(W)))
+            W = int(W * render_scale)
+            H = int(H * render_scale)
+            fx *= render_scale
+            fy *= render_scale
+            cx *= render_scale
+            cy *= render_scale
+
+        tanfovx = W / (2.0 * fx)
+        tanfovy = H / (2.0 * fy)
 
         T_cam_world = (
             torch.from_numpy(np.ascontiguousarray(camera.T_cam_world))
@@ -291,9 +323,7 @@ class GSScene:
             .cuda(non_blocking=True)
         )
         viewmatrix = T_cam_world.transpose(0, 1)
-        projmatrix = self._get_proj(
-            camera.fx, camera.fy, camera.cx, camera.cy, camera.W, camera.H
-        )
+        projmatrix = self._get_proj(fx, fy, cx, cy, W, H)
 
         full_projmatrix = (viewmatrix.unsqueeze(0).bmm(projmatrix.unsqueeze(0))).squeeze(0)
 
@@ -304,8 +334,8 @@ class GSScene:
         )
 
         raster_settings = GaussianRasterizationSettings(
-            image_height=camera.H,
-            image_width=camera.W,
+            image_height=H,
+            image_width=W,
             tanfovx=tanfovx,
             tanfovy=tanfovy,
             bg=self._bg,
@@ -341,6 +371,14 @@ class GSScene:
         rendered_depth = torch.zeros_like(depth_numerator)
         valid = accum_alpha > 1e-6
         rendered_depth[valid] = depth_numerator[valid] / accum_alpha[valid]
+
+        if render_scale > 1.0:
+            import torch.nn.functional as F
+            rendered_depth = F.interpolate(
+                rendered_depth.unsqueeze(0).unsqueeze(0),
+                size=(camera.H, camera.W),
+                mode='nearest'
+            ).squeeze(0).squeeze(0)
 
         depth = rendered_depth.detach().cpu().numpy().astype(np.float32, copy=False)
         self._last_depth_key = depth_key

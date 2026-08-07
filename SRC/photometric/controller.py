@@ -152,7 +152,7 @@ class PhotometricControllerTorch:
         self,
         scene: Optional[Any] = None,
         target_camera: Optional[Camera] = None,
-        gain: float = 0.005,
+        gain: float = 0.75,
         sigma_blur: float = 1.0,
         use_gzn: bool = True,
         grad_percentile: float = 50.0,
@@ -168,6 +168,8 @@ class PhotometricControllerTorch:
         min_pixels: Optional[int] = None,
         stop_mse_per_px: float = 2.0e-6,
         stop_ssd: Optional[float] = None,
+        stop_plateau_iters: Optional[int] = None,
+        stop_plateau_ratio: float = 0.99,
         min_interaction_rank: int = DEFAULT_MIN_INTERACTION_RANK,
         max_interaction_condition: Optional[float] = DEFAULT_MAX_INTERACTION_CONDITION,
         device: Optional[str] = None,
@@ -198,6 +200,10 @@ class PhotometricControllerTorch:
         self.min_depth = float(min_depth)
         self.stop_mse_per_px = float(stop_mse_per_px)
         self.stop_ssd_threshold = None if stop_ssd is None else float(stop_ssd)
+        self.stop_plateau_iters = int(stop_plateau_iters) if stop_plateau_iters is not None else None
+        self.stop_plateau_ratio = float(stop_plateau_ratio)
+        self.best_mse = float("inf")
+        self.plateau_count = 0
         (
             self.min_interaction_rank,
             self.max_interaction_condition,
@@ -240,9 +246,19 @@ class PhotometricControllerTorch:
         if (
             mse is not None
             and np.isfinite(float(mse))
-            and float(mse) <= self.stop_mse_per_px
         ):
-            return "photometric_mse_below_threshold"
+            mse = float(mse)
+            if mse <= self.stop_mse_per_px:
+                return "photometric_mse_below_threshold"
+
+            if self.stop_plateau_iters is not None:
+                if mse < self.best_mse * self.stop_plateau_ratio:
+                    self.best_mse = mse
+                    self.plateau_count = 0
+                else:
+                    self.plateau_count += 1
+                    if self.plateau_count >= self.stop_plateau_iters:
+                        return "plateau"
         return None
 
     def __call__(
@@ -290,7 +306,7 @@ class PhotometricControllerTorch:
         else:
             depth_np = get_depth(_as_numpy(rendered), scene=self.scene, use_intrinsic=False)
 
-        depth = torch.as_tensor(np.asarray(depth_np), dtype=torch.float32, device=device)
+        depth = _as_tensor(depth_np, device)
         if depth.ndim != 2:
             raise ValueError(f"depth must be HxW, got shape {tuple(depth.shape)}")
         return depth
@@ -480,7 +496,16 @@ class PhotometricControllerTorch:
         H_reg = H + float(reg) * torch.diag(diag)
         H_reg = H_reg + 1.0e-12 * torch.eye(6, dtype=H_reg.dtype, device=device)
         try:
-            step = torch.linalg.solve(H_reg, g)
+            try:
+                step = torch.linalg.solve(H_reg, g)
+            except RuntimeError:
+                # The 6x6 normal-equations solve is trivial, but cuSOLVER can
+                # still fail to initialise (CUSOLVER_STATUS_INTERNAL_ERROR on
+                # cusolverDnCreate) when the GPU is memory-starved -- e.g. the
+                # 6GB laptop card with a NeRF renderer resident. That is a
+                # GPU-resource failure, not a singular system, so retry the tiny
+                # solve on CPU instead of failing the whole task.
+                step = torch.linalg.solve(H_reg.detach().cpu(), g.detach().cpu()).to(device)
             velocity = (-self.gain * step).to(torch.float32)
             if torch.isfinite(velocity).all():
                 solve_fault = None
@@ -488,6 +513,8 @@ class PhotometricControllerTorch:
                 velocity = torch.zeros(6, dtype=torch.float32, device=device)
                 solve_fault = "measurement_invalid_nonfinite_velocity"
         except RuntimeError:
+            # Even the CPU retry failed (genuinely pathological system); keep the
+            # original cut-and-continue behaviour rather than aborting the run.
             velocity = torch.zeros(6, dtype=torch.float32, device=device)
             solve_fault = "measurement_invalid_solve_failed"
 

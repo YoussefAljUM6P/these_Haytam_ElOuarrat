@@ -31,7 +31,8 @@ ARCH_LIST="8.0"
 
 ENV_NAME="servis"
 CONDA_BASE="$HOME/miniconda3"
-REPO="$HOME/lustre/med_img-z2y8h4a967e/code_Haytam/SERVIS"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="${SERVIS_REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 # -----------------------------------------------------------------------------
 
 echo "[setup] node=$(hostname)  repo=$REPO"

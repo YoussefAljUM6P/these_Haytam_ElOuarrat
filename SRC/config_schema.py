@@ -58,6 +58,7 @@ OPT_STR = "opt_str"        # null | string
 CHOICE = "choice"          # lowercased, must be in `choices`
 FEATURE = "feature"        # lowercased string (open set)
 STR_LIST = "str_list"      # comma string or list -> non-empty list[str]
+INT_LIST = "int_list"      # null | comma string | list -> list[int] (or None)
 SCENE_DIR = "scene_dir"    # -> resolved Path under DATA/
 
 
@@ -255,6 +256,11 @@ FIELDS: tuple[Field, ...] = (
     Field("takes_jump_factor", "TAKES_JUMP_FACTOR", FLOAT, (TRAJECTORY,),
           default=5.0, section="advanced",
           help="Motion factor that marks a take boundary."),
+    Field("take_indices", "TAKE_INDICES", INT_LIST, (TRAJECTORY,),
+          default=None, optional=True, ask=False, section="advanced",
+          help="1-based take indices to run (blank=every take); "
+               "implies --use-takes.",
+          aliases=("takes", "take")),
     Field("dynamic_ibvs_iters", "DYNAMIC_IBVS_ITERS", BOOL, (TRAJECTORY,),
           default=True, section="advanced",
           help="Use the paper eq.7 dynamic IBVS iteration schedule."),

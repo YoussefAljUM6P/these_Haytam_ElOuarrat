@@ -6,8 +6,7 @@ passes, the in-framework NeRF renderer is using the exact same camera convention
 as `ns-render`, so any remaining servoing discrepancy is not a pose-mapping bug.
 
 Run with the env that has nerfstudio installed, e.g.:
-    /home/haytam-elourrat/miniconda3/envs/viservo/bin/python \
-        SRC/validate_nerf_pose.py DATA/bonsai
+    python SRC/validate_nerf_pose.py DATA/bonsai
 """
 
 import sys

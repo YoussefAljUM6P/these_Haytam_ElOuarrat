@@ -29,6 +29,7 @@ from config_schema import (
     FEATURE,
     FLOAT,
     INT,
+    INT_LIST,
     OPT_FLOAT,
     OPT_INT,
     OPT_STR,
@@ -135,6 +136,8 @@ def coerce_field_value(field, value):
     t = field.type
     if t == STR_LIST:
         return coerce_str_list(value)
+    if t == INT_LIST:
+        return coerce_int_list(value)
     if t == SCENE_DIR:
         return coerce_scene_dir(value)
     if t == BOOL:
@@ -197,6 +200,32 @@ def coerce_str_list(value):
     if not items:
         raise ValueError("datasets must not be empty")
     return items
+
+
+def coerce_int_list(value):
+    """null | "1,3" | "[1,3]" | [1, 3] -> ordered unique list[int], or None.
+
+    Entries are 1-based take indices (>= 1); duplicates are dropped keeping the
+    caller's order. An empty/blank value means "no selection" -> None (all takes).
+    """
+    if is_null_value(value):
+        return None
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        text = str(value).strip().strip("[]")
+        items = [part for part in text.replace(" ", "").split(",") if part]
+
+    seen = set()
+    out = []
+    for item in items:
+        n = int(item)
+        if n < 1:
+            raise ValueError("take_indices entries must be >= 1 (1-based)")
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out or None
 
 
 def coerce_scene_dir(value):
