@@ -9,6 +9,12 @@ ViSERVO: virtual visual servoing for 6-DOF camera pose estimation. Given a targe
 - **Metrics**: pose error (rot deg, trans m), convergence rate, iters / wall-clock.
 - Working hypothesis: photometric + 3DGS wins (appearance fidelity closes the domain gap).
 
+## Benchmark dataset
+- Use the Stanford RGB Camera Relocalization Dataset: <https://graphics.stanford.edu/projects/reloc/>.
+- It contains RGB-D sequences and globally aligned camera-to-world poses for 4 large scenes (12 rooms).
+- Keep the downloaded data under `DATA/`; it is not committed.
+- Prepare each room as the COLMAP-aligned SERVIS scene contract before running experiments. The raw Stanford layout is not consumed directly by `SRC/dataset.py`.
+
 ## Layout
 - `SRC/` — project code. Single entry point: `cli.py`.
 - `SRC/runners/` — runnable experiments (`smoke`, `servo_frames`, `trajectory`, `matrix`). Not executed directly; dispatched by `cli.py`.
@@ -18,6 +24,7 @@ ViSERVO: virtual visual servoing for 6-DOF camera pose estimation. Given a targe
 - `DATA/` — scenes (e.g. `DATA/kitchen`). Not committed.
 - `RUNS/` — experiment outputs. Not committed.
 - `CONFIGS/` — experiment JSONs.
+- `paper/` — LaTeX manuscript, bibliography, and publication figures.
 
 ## Run
 ```bash
@@ -39,7 +46,7 @@ python cli.py matrix       --dataset kitchen --iterations 30
 `SRC/depth.py` is the only depth entry point. Default = MoGe2 (`get_depth(..., use_intrinsic=False)` / `estimate_depth_moge`). MoGe2 is metric — no scale alignment. Scene-intrinsic depth (`scene.render_depth()`) is opt-in via `use_intrinsic=True`. If the requested estimator fails, raise — never silently fall back, never swap the default without explicit instruction.
 
 ## Don't commit
-Generated images, datasets (`DATA/`), runs (`RUNS/`), `__pycache__`, third-party edits.
+Generated images (except selected publication figures under `paper/figures/`), datasets (`DATA/`), runs (`RUNS/`), `__pycache__`, third-party edits.
 
 ## When unsure
 Ask before architectural changes.

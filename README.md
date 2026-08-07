@@ -21,6 +21,7 @@ update, applies it on SE(3), and repeats.
 - [Requirements and backend support](#requirements-and-backend-support)
 - [Installation](#installation)
 - [Preparing a dataset](#preparing-a-dataset)
+- [Paper source](#paper-source)
 - [First run](#first-run)
 - [Command-line workflows](#command-line-workflows)
 - [Configuration](#configuration)
@@ -103,6 +104,7 @@ SERVIS/
 ├── CONFIGS/                      # stable JSON configurations
 ├── DATA/                         # local scenes; ignored by Git
 ├── RUNS/                         # generated experiments; ignored by Git
+├── paper/                        # LaTeX manuscript and publication figures
 ├── scripts/                      # publishing, profiling, cluster helpers
 ├── requirements.txt              # audited first-party dependencies
 └── .gitmodules                   # MoGe, XFeat, and 3DGS dependencies
@@ -235,6 +237,23 @@ assumptions and currently expects a top-level <code>environment.yml</code>.
 Audit it for the target cluster before use.
 
 ## Preparing a dataset
+
+### Selected benchmark: Stanford RGB Camera Relocalization Dataset
+
+The experiments use the [Stanford RGB Camera Relocalization Dataset](https://graphics.stanford.edu/projects/reloc/)
+introduced with *Learning to Navigate the Energy Landscape*. It contains RGB-D
+captures of four large scenes spanning 12 rooms. Each sequence provides color
+frames, depth in millimetres, camera-to-world poses, and camera calibration;
+sequences belonging to the same scene have globally aligned poses. The dataset
+is distributed under CC BY-NC-SA 4.0. Cite the accompanying publication when
+using it.
+
+The Stanford download is the source benchmark, not a directly runnable SERVIS
+scene. Keep it below the ignored <code>DATA/</code> tree and prepare each room
+using the scene contract below: preserve the provided camera-to-world frame,
+create the required COLMAP model/image layout, and construct the mesh, 3DGS,
+and NeRF assets in that same world frame. SERVIS does not currently download or
+convert the raw sequences automatically.
 
 ### Required scene contract
 
@@ -401,6 +420,20 @@ mv DATA/my_scene/takes.json DATA/my_scene/takes.json.bak
 
 The scene directory must be writable when trajectory needs to generate
 <code>takes.json</code>. Supply an existing valid cache for a read-only mount.
+
+## Paper source
+
+The publication source is kept separately from runtime code in
+<code>paper/</code>. The directory contains the compilable LaTeX manuscript,
+BibTeX references, and a dedicated <code>figures/</code> folder. From the
+repository root, build it with:
+
+~~~bash
+make -C paper
+~~~
+
+Generated LaTeX build products remain ignored; manuscript sources and selected
+publication figures are versioned.
 
 ## First run
 
