@@ -50,16 +50,16 @@ hypothesis is already proven.
 
 ~~~mermaid
 flowchart LR
-    A[COLMAP camera and real target frame] --> B[Initial T_world_cam]
-    B --> C[Mesh / 3DGS / NeRF render]
-    C --> D[Intrinsic depth or MoGe2 depth]
-    C --> E[Feature error or photometric error]
-    D --> F[Interaction matrix]
+    A["COLMAP camera and real target frame"] --> B["Initial T_world_cam"]
+    B --> C["Mesh / 3DGS / NeRF render"]
+    C --> D["Intrinsic depth or MoGe2 depth"]
+    C --> E["Feature error or photometric error"]
+    D --> F["Interaction matrix"]
     E --> F
-    F --> G[Guarded LM / damped 6-DoF solve]
-    G --> H[SE(3) camera-pose update]
+    F --> G["Guarded LM / damped 6-DoF solve"]
+    G --> H["SE(3) camera-pose update"]
     H --> C
-    H --> I[History, trajectories, renders, evo metrics]
+    H --> I["History, trajectories, renders, evo metrics"]
 ~~~
 
 The important implementation boundaries are:
