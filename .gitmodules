@@ -1,0 +1,12 @@
+[submodule "SRC/third_party/MoGe"]
+	path = SRC/third_party/MoGe
+	url = https://github.com/microsoft/MoGe.git
+[submodule "SRC/third_party/accelerated_features"]
+	path = SRC/third_party/accelerated_features
+	url = https://github.com/verlab/accelerated_features.git
+[submodule "SRC/third_party/diff-gaussian-rasterization"]
+	path = SRC/third_party/diff-gaussian-rasterization
+	url = https://github.com/graphdeco-inria/diff-gaussian-rasterization.git
+[submodule "SRC/third_party/gaussian-splatting"]
+	path = SRC/third_party/gaussian-splatting
+	url = https://github.com/graphdeco-inria/gaussian-splatting.git

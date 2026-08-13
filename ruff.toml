@@ -1,0 +1,24 @@
+# Ruff configuration for SERVIS (added during the 2026-07-03 audit).
+# Codifies the linting baseline already in use so `ruff check` is reproducible.
+# Config only — does not change any runtime behavior.
+
+line-length = 100
+target-version = "py310"
+
+# Vendored upstream code is never linted or edited (see AGENTS.md).
+extend-exclude = ["SRC/third_party"]
+
+[lint]
+# Ruff defaults (E4, E7, E9, F). The codebase is already clean under this set;
+# kept minimal to match the established style rather than impose a new one.
+
+[lint.per-file-ignores]
+# These scripts insert the repo/SRC root onto sys.path before importing
+# first-party modules, so first-party imports legitimately follow statements.
+"SRC/compare_runs.py" = ["E402"]
+"SRC/render_offline.py" = ["E402"]
+"SRC/scenes/gs.py" = ["E402"]
+"SRC/trajectory_visuals_to_video.py" = ["E402"]
+# SE(3) hat operator: semicolon-aligned skew-symmetric matrix assignment is
+# intentional, readable frame math — not a style defect.
+"SRC/servo.py" = ["E702"]

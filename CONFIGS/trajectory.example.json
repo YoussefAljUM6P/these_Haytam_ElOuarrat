@@ -1,0 +1,18 @@
+{
+  "kind": "trajectory",
+  "datasets": [
+    "example_scene"
+  ],
+  "renderer": "mesh",
+  "controller": "ibvs",
+  "depth_mode": "intrinsic",
+  "feature_method": "sift",
+  "start_index": 1,
+  "stride": 1,
+  "mini_iterations": 100,
+  "max_pairs": 10,
+  "use_takes": true,
+  "continue_on_task_failure": false,
+  "save_task_viz": true,
+  "run_tag": "example_mesh_ibvs"
+}

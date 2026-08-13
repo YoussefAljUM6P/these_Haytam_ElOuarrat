@@ -1,0 +1,36 @@
+# SERVIS runtime dependencies
+#
+# Generated during the 2026-07-03 audit by scanning the actual top-level imports
+# of non-vendored SRC/ code (SRC/third_party/ is excluded — its deps are its own).
+# Versions are pinned to the audited local environment for reproducibility; relax
+# to >= if a looser constraint is needed. Vendored 3DGS/nerfstudio code pulls
+# additional packages (torchvision, kornia, tqdm, h5py, ...) via its own setup.
+#
+# NOTE: This manifest documents the import surface; nothing in the code reads it,
+# so it cannot change runtime behavior. Adjust pins to taste.
+
+# --- core ---
+numpy==2.4.4
+scipy==1.17.1
+torch==2.11.0
+opencv-python-headless==4.13.0.92
+pillow==12.2.0
+matplotlib==3.10.9
+
+# --- geometry / IO ---
+trimesh==4.12.2
+pyrender==0.1.45
+plyfile==1.1.3
+pycolmap==4.0.4
+
+# --- trajectory evaluation ---
+evo==1.36.4
+
+# --- CLI ---
+rich==14.2.0
+questionary        # lazy-imported by the cli.py interactive wizard only
+python-telegram-bot>=21,<22   # lazy-imported by the `cli.py bot` phone launcher only
+
+# --- optional backends (lazy-imported; install as needed) ---
+# moge             # MoGe2 depth backend (SRC/depth.py default); installs on login node only
+# nerfstudio       # NeRF renderer backend (SRC/scenes/nerf.py)
